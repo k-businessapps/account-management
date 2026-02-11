@@ -45,13 +45,11 @@ def _require_secrets():
 
     if missing:
         st.error(
-            "Missing required secrets. Add these keys in .streamlit/secrets.toml.
-
-"
-            + "
-".join([f"- {m}" for m in missing])
+            "Missing required secrets. Add these keys in .streamlit/secrets.toml.\n\n"
+            + "\n".join(f"- {m}" for m in missing)
         )
         st.stop()
+
 
 
 def inject_brand_css():
