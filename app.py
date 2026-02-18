@@ -14,7 +14,7 @@ except Exception:
 
 
 APP_TITLE = "Account Management"
-APP_SUBTITLE = "Upsells and churn, aligned to renewal validity and month-end cutoffs"
+APP_SUBTITLE = "KPIs based on Upsells and churn"
 
 
 # KrispCall palette (official)
@@ -193,7 +193,7 @@ def render_header():
                 <div class="kc-title">{APP_TITLE}</div>
                 <div class="kc-subtitle">{APP_SUBTITLE}</div>
               </div>
-              <div style="margin-left:auto" class="kc-badge">KrispCall branded</div>
+              <div style="margin-left:auto" class="kc-badge">KrispCall</div>
             </div>
             """,
             unsafe_allow_html=True
