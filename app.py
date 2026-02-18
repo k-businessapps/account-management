@@ -15,7 +15,7 @@ except Exception:
 
 
 APP_TITLE = "Account Management"
-APP_SUBTITLE = "Upsells and churn KPIs"
+APP_SUBTITLE = "Upsells and churn aligned to renewal validity and month-end cutoffs"
 
 # KrispCall palette
 KC_LIGHT_PINKISH_PURPLE = "#F4B7FF"
@@ -26,17 +26,19 @@ KC_WHITE = "#FFFFFF"
 KC_LIGHT_GRAY = "#EFEFEF"
 KC_TEXT = "#15151A"
 
-# Only keep what we actually use from Mixpanel export
+# Only fields we use from Mixpanel export
 MIXPANEL_KEEP_PROPS = [
     "distinct_id",
     "time",
     "$insert_id",
-    "mp_processing_time_ms",  # optional, helps pick the latest processed dupe
+    "mp_processing_time_ms",
     "$email",
     "Amount",
     "Amount Description",
     "Amount breakdown",
 ]
+
+EMAIL_RE = re.compile(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", re.IGNORECASE)
 
 
 def _require_secrets():
@@ -218,17 +220,37 @@ def _normalize_email(s: object):
     return s
 
 
-_EMAIL_RE = re.compile(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", re.IGNORECASE)
-
-
 def _extract_email_from_text(txt: object):
     if txt is None:
         return None
-    m = _EMAIL_RE.search(str(txt))
+    m = EMAIL_RE.search(str(txt))
     return m.group(1).lower() if m else None
 
 
-def _parse_unix_time_to_utc_dt(series: pd.Series) -> pd.Series:
+def _normalize_time_to_seconds(v) -> int | None:
+    """
+    Normalize Mixpanel 'time' to epoch seconds (int).
+    Handles seconds, milliseconds, strings.
+    """
+    if v is None:
+        return None
+    try:
+        t = int(float(v))
+        # milliseconds check
+        if t > 10**11:
+            t = t // 1000
+        return t
+    except Exception:
+        try:
+            dt = pd.to_datetime(v, errors="coerce", utc=True)
+            if pd.isna(dt):
+                return None
+            return int(dt.value // 10**9)
+        except Exception:
+            return None
+
+
+def _epoch_s_to_dt_utc(series: pd.Series) -> pd.Series:
     t = pd.to_numeric(series, errors="coerce")
     if t.notna().all():
         is_ms = float(t.median()) > 1e11
@@ -238,43 +260,41 @@ def _parse_unix_time_to_utc_dt(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 
-def dedupe_mixpanel_export(df: pd.DataFrame) -> pd.DataFrame:
-    required = ["event", "distinct_id", "time", "$insert_id"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing columns: {missing}. Available: {list(df.columns)}")
+def _row_is_candidate(desc_lower: str) -> bool:
+    """
+    Streaming prefilter to reduce Mixpanel volume.
+    Keep only rows that can matter for renewals or annual logic.
+    """
+    if not desc_lower:
+        return False
 
-    df = df.copy()
+    if "workspace subscription" in desc_lower:
+        return True
+    if "number purchased" in desc_lower:
+        return True
+    if "agent added" in desc_lower and "," in desc_lower:
+        return True
+    if "number renew" in desc_lower:
+        return True
+    if EMAIL_RE.search(desc_lower):
+        return True
 
-    t = pd.to_numeric(df["time"], errors="coerce")
-    if t.notna().all():
-        if float(t.median()) > 1e11:
-            t = (t // 1000)
-        df["_time_s"] = t.astype("Int64")
-    else:
-        dt = pd.to_datetime(df["time"], errors="coerce", utc=True)
-        df["_time_s"] = (dt.view("int64") // 10**9).astype("Int64")
-
-    sort_cols = ["_time_s"]
-    if "mp_processing_time_ms" in df.columns:
-        sort_cols = ["mp_processing_time_ms"] + sort_cols
-
-    df = df.sort_values(sort_cols, kind="mergesort")
-
-    before = len(df)
-    df = df.drop_duplicates(subset=["event", "distinct_id", "_time_s", "$insert_id"], keep="last")
-    df = df.drop(columns=["_time_s"], errors="ignore")
-    after = len(df)
-
-    st.sidebar.caption(f"Mixpanel dedupe removed {before - after} duplicates. Remaining {after}.")
-    return df
+    return False
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_mixpanel_npm(to_date: date) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=3)
+def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
+    """
+    Memory-safe fetch:
+    - streams export
+    - keeps only required columns
+    - filters early
+    - dedupes in streaming dictionary by (event, distinct_id, time_s, $insert_id)
+      keeping latest by mp_processing_time_ms then by arrival
+    """
     mp = st.secrets["mixpanel"]
     project_id = str(mp["project_id"]).strip()
-    from_date = str(mp["from_date"]).strip()  # fixed to 2023-05-01 in secrets
+    from_date = str(mp["from_date"]).strip()
     to_date_str = to_date.isoformat()
 
     events = ["New Payment Made"]
@@ -294,8 +314,16 @@ def fetch_mixpanel_npm(to_date: date) -> pd.DataFrame:
         "authorization": str(mp["auth_header"]).strip(),
     }
 
-    rows = []
-    with requests.get(url, headers=headers, stream=True, timeout=180) as r:
+    kept = {}
+    stats = {
+        "lines_read": 0,
+        "rows_kept_prefilter": 0,
+        "rows_dedup_final": 0,
+        "dupes_replaced": 0,
+        "dupes_skipped": 0,
+    }
+
+    with requests.get(url, headers=headers, stream=True, timeout=240) as r:
         if r.status_code != 200:
             raise RuntimeError(f"Mixpanel export failed. Status {r.status_code}. Body: {r.text[:500]}")
 
@@ -303,27 +331,68 @@ def fetch_mixpanel_npm(to_date: date) -> pd.DataFrame:
             if not line:
                 continue
 
+            stats["lines_read"] += 1
+
             obj = json.loads(line)
             props = obj.get("properties") or {}
 
+            # Pull only the fields we keep
             rec = {"event": obj.get("event")}
             for k in MIXPANEL_KEEP_PROPS:
                 rec[k] = props.get(k)
 
-            rows.append(rec)
+            desc = rec.get("Amount Description")
+            desc_lower = str(desc).lower() if desc is not None else ""
 
-    if not rows:
-        return pd.DataFrame()
+            # early filter
+            if not _row_is_candidate(desc_lower):
+                continue
 
-    df = pd.DataFrame(rows)
+            stats["rows_kept_prefilter"] += 1
 
-    # Ensure required fields exist
-    for c in ["event", "distinct_id", "time", "$insert_id"]:
-        if c not in df.columns:
-            df[c] = pd.NA
+            event = rec.get("event")
+            distinct_id = rec.get("distinct_id")
+            insert_id = rec.get("$insert_id")
+            time_s = _normalize_time_to_seconds(rec.get("time"))
 
-    df = dedupe_mixpanel_export(df)
-    return df
+            if event is None or distinct_id is None or insert_id is None or time_s is None:
+                # cannot dedupe safely, drop
+                continue
+
+            key = (event, distinct_id, time_s, insert_id)
+
+            mp_pt = rec.get("mp_processing_time_ms")
+            try:
+                mp_pt_num = int(float(mp_pt)) if mp_pt is not None else None
+            except Exception:
+                mp_pt_num = None
+
+            if key not in kept:
+                kept[key] = (mp_pt_num, rec)
+            else:
+                old_mp_pt, old_rec = kept[key]
+
+                # Keep the latest processed version when duplicates exist
+                if old_mp_pt is None and mp_pt_num is None:
+                    kept[key] = (mp_pt_num, rec)
+                    stats["dupes_replaced"] += 1
+                elif old_mp_pt is None and mp_pt_num is not None:
+                    kept[key] = (mp_pt_num, rec)
+                    stats["dupes_replaced"] += 1
+                elif old_mp_pt is not None and mp_pt_num is None:
+                    stats["dupes_skipped"] += 1
+                else:
+                    if mp_pt_num >= old_mp_pt:
+                        kept[key] = (mp_pt_num, rec)
+                        stats["dupes_replaced"] += 1
+                    else:
+                        stats["dupes_skipped"] += 1
+
+    rows = [v[1] for v in kept.values()]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    stats["rows_dedup_final"] = len(df)
+
+    return df, stats
 
 
 def _find_col(df: pd.DataFrame, candidates: list[str]):
@@ -431,8 +500,8 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     else:
         deals["_deal_value_num"] = 0.0
 
+    # Dedup email-month. Prioritize Pipedrive Krispcall the least
     deals["_dedup_key"] = deals["EmailKey"].fillna("__missing_email__") + "|" + deals["DealMonth"].astype(str)
-
     grp_counts = deals.groupby("_dedup_key")["_dedup_key"].transform("count")
     deals["Dedup Group Count"] = grp_counts
     deals["Dedup Dropped Duplicates"] = grp_counts.gt(1)
@@ -463,6 +532,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         return deals_out, summary_all, summary_connected
 
     npm = npm_df.copy()
+    npm = npm.loc[:, ~npm.columns.duplicated()].copy()
 
     col_email = _find_col(npm, ["$email", "email"])
     col_amount_desc = _find_col(npm, ["Amount Description"])
@@ -473,7 +543,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     if col_time is None or col_amount is None:
         raise KeyError("Mixpanel export is missing required fields. Needed: time and Amount.")
 
-    npm["PayDT"] = _parse_unix_time_to_utc_dt(npm[col_time])
+    npm["PayDT"] = _epoch_s_to_dt_utc(npm[col_time])
     npm["PayMonth"] = npm["PayDT"].dt.to_period("M").dt.to_timestamp()
     npm["AmountNum"] = pd.to_numeric(npm[col_amount], errors="coerce")
 
@@ -517,7 +587,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     annual_user_set = set(annual_candidates["EmailKey"].unique())
 
-    # Monthly renewal mapping filters
     def _contains(s: pd.Series, pat: str) -> pd.Series:
         return s.str.contains(pat, case=False, na=False)
 
@@ -531,13 +600,29 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     renewals = npm_valid[renewal_mask].copy()
 
     renewals = renewals[renewals["PayDT"].notna()].copy()
-    renewals = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
+    renewals = renewals.loc[:, ~renewals.columns.duplicated()].copy()
 
-    grp = renewals.groupby(["EmailKey", "PayMonth"], as_index=False)
-    txn_count = grp.size().rename(columns={"size": "Renew Txn Count"})
-    idx_latest = grp["PayDT"].idxmax()
+    # FIX: robust latest-per-email-month logic (no idxmax)
+    txn_count = (
+        renewals.groupby(["EmailKey", "PayMonth"])
+        .size()
+        .rename("Renew Txn Count")
+        .reset_index()
+    )
 
-    latest_rows = renewals.loc[idx_latest].copy()
+    renewals_sorted = renewals.sort_values(
+        ["EmailKey", "PayMonth", "PayDT"],
+        kind="mergesort"
+    )
+
+    latest_rows = (
+        renewals_sorted.drop_duplicates(
+            subset=["EmailKey", "PayMonth"],
+            keep="last"
+        )
+        .copy()
+    )
+
     latest_rows = latest_rows.merge(txn_count, on=["EmailKey", "PayMonth"], how="left")
     latest_rows["Renew Multiple Flag"] = latest_rows["Renew Txn Count"].fillna(0).astype(int) > 1
 
@@ -604,7 +689,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         _lookup_mult(e, m) for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Month-end churn cutoff. Active if valid till is on or after next month start
+    # Month-end churn cutoff
     deals_dedup["MonthEndDT"] = (deals_dedup["DealMonth"] + pd.offsets.MonthEnd(0)) + pd.Timedelta(hours=23, minutes=59, seconds=59)
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
@@ -669,7 +754,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
-    # Upsell rules. Ignore annual. If prev is 0 or NA, upsell is 0. If churned, upsell is 0.
+    # Upsell rules: ignore annual, if prev is 0 or NA then upsell is 0, if churned then upsell is 0
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
     eligible = (prev_amt > 0) & (~deals_dedup["Churned (AsOf MonthEnd)"]) & (~deals_dedup["Annual Active (AsOf MonthEnd)"])
@@ -744,6 +829,7 @@ def kpi_row(summary_df: pd.DataFrame):
 
 def main():
     st.set_page_config(page_title="KrispCall. Account Management", page_icon="📞", layout="wide")
+
     _require_secrets()
     inject_brand_css()
     render_header()
@@ -768,11 +854,15 @@ def main():
 
     if "npm_cached" not in st.session_state:
         st.session_state["npm_cached"] = None
+    if "npm_stats" not in st.session_state:
+        st.session_state["npm_stats"] = None
 
     if fetch_btn:
-        with st.spinner("Fetching New Payment Made events from Mixpanel (reduced columns)..."):
+        with st.spinner("Fetching New Payment Made events from Mixpanel (reduced columns, filtered, deduped)..."):
             try:
-                st.session_state["npm_cached"] = fetch_mixpanel_npm(end_date)
+                npm_df, stats = fetch_mixpanel_npm(end_date)
+                st.session_state["npm_cached"] = npm_df
+                st.session_state["npm_stats"] = stats
                 st.success("Payments fetched.")
             except Exception as e:
                 st.error(str(e))
@@ -782,6 +872,19 @@ def main():
     if npm_df is None:
         st.warning("Click Fetch payments to load Mixpanel events for calculations.")
         return
+
+    stats = st.session_state.get("npm_stats") or {}
+    if stats:
+        st.sidebar.markdown("### Mixpanel fetch stats")
+        st.sidebar.write(
+            {
+                "lines_read": stats.get("lines_read"),
+                "rows_kept_prefilter": stats.get("rows_kept_prefilter"),
+                "rows_dedup_final": stats.get("rows_dedup_final"),
+                "dupes_replaced": stats.get("dupes_replaced"),
+                "dupes_skipped": stats.get("dupes_skipped"),
+            }
+        )
 
     with st.spinner("Building enriched dataset..."):
         deals_enriched, summary_all, summary_connected = build_enriched_deals(deals_raw, npm_df)
@@ -834,7 +937,7 @@ def main():
 
     with tab4:
         st.markdown(
-            '<div class="kc-card"><h3>Payments dataset</h3><p class="kc-note">Reduced columns after deduplication. First 200 rows shown.</p></div>',
+            '<div class="kc-card"><h3>Payments dataset</h3><p class="kc-note">Reduced columns after prefilter and dedupe. First 200 rows shown.</p></div>',
             unsafe_allow_html=True,
         )
         st.write("")
