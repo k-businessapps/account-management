@@ -30,6 +30,7 @@ ALLOWED_ANNUAL_BREAKDOWN_NUMS = [
 ]
 
 ANNUAL_AMOUNT_THRESHOLD = 40.0
+ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
 
 
 def _require_secrets():
@@ -202,6 +203,8 @@ def _row_is_candidate(desc_lower: str) -> bool:
         return False
     if "workspace subscription" in desc_lower:
         return True
+    if "upgrade plan to yearly subscription" in desc_lower:
+        return True
     if "number purchased" in desc_lower:
         return True
     if "agent added" in desc_lower and "," in desc_lower:
@@ -252,17 +255,13 @@ def _clean_breakdown_str(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
     s = str(x)
-    s = s.replace("\u00a0", "")  # non-breaking space
+    s = s.replace("\u00a0", "")
     s = re.sub(r"\s+", "", s)
     return s
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=3)
 def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
-    """
-    Streaming fetch. Keep minimal fields only.
-    Fixes Amount Breakdown by reading the correct key from Mixpanel properties.
-    """
     mp = st.secrets["mixpanel"]
     project_id = str(mp["project_id"]).strip()
     from_date = str(mp["from_date"]).strip()
@@ -315,13 +314,12 @@ def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
                 "$email": props.get("$email"),
                 "Amount": props.get("Amount"),
                 "Amount Description": props.get("Amount Description"),
-                # IMPORTANT. Correct key names for flattened data.
                 "Amount Breakdown": _prop_any(props, ["Amount Breakdown", "Amount breakdown", "AmountBreakdown"]),
                 "Amount Breakdown by Unit": _prop_any(props, ["Amount Breakdown by Unit", "Amount breakdown by unit"]),
             }
 
             desc = rec.get("Amount Description")
-            desc_lower = str(desc).lower() if desc is not None else ""
+            desc_lower = str(desc).lower().strip() if desc is not None else ""
             if not _row_is_candidate(desc_lower):
                 continue
 
@@ -462,7 +460,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     npm = npm_df.copy()
     npm = npm.loc[:, ~npm.columns.duplicated()].copy()
 
-    # Ensure presence of canonical names
     if "Amount Breakdown" not in npm.columns:
         npm["Amount Breakdown"] = pd.NA
     if "Amount Breakdown by Unit" not in npm.columns:
@@ -486,12 +483,14 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     npm_valid = npm.dropna(subset=["EmailKey", "PayDT"]).copy()
 
     desc = npm_valid["Amount Description"].astype(str)
-    desc_lower = desc.str.lower()
+    desc_lower = desc.str.lower().str.strip()
     breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
 
-    # Annual detection
-    annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & desc_lower.str.contains(
-        "workspace subscription", na=False
+    # Annual detection additions:
+    # - annual start: amount>40 AND (contains "workspace subscription" OR exact "upgrade plan to yearly subscription.")
+    annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
+        desc_lower.str.contains("workspace subscription", na=False)
+        | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
     )
 
     desc_no_comma = ~desc.str.contains(",", na=False)
@@ -514,13 +513,11 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
 
     annual_user_set = set(annual_candidates["EmailKey"].unique())
 
-    # Renewal payments used for mapping current and previous month amounts
     cond_email_in_desc = contains_email
     cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
     cond_workspace_sub = desc_lower.str.contains("workspace subscription", na=False)
 
-    # Number Renew mapping only for annual users
     cond_number_renew_for_mapping = desc_lower.str.contains("number renew", na=False) & npm_valid["EmailKey"].isin(annual_user_set)
 
     renewal_mask = (
@@ -532,7 +529,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     )
     renewals = npm_valid[renewal_mask].copy()
 
-    # Latest txn per email-month for amount mapping + flags
     renewals_sorted = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
 
     txn_count = (
@@ -571,7 +567,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         bool(_map_from_latest(e, m, "Renew Multiple Flag", False)) for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Build deal-month index
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -579,7 +574,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         .sort_values(["EmailKey", "DealMonth"], kind="mergesort")
     )
 
-    # Monthly validity should NOT be extended by Number Renew
     renewals_for_validity = renewals.copy()
     renewals_for_validity = renewals_for_validity[
         ~renewals_for_validity["Amount Description"].astype(str).str.contains("number renew", case=False, na=False)
@@ -603,7 +597,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         how="left",
     )
 
-    # Annual latest in month + ffill
     annual_simple = annual_candidates.dropna(subset=["EmailKey", "PayDT"]).copy()
     annual_simple = annual_simple.assign(PayMonth=annual_simple["PayDT"].dt.to_period("M").dt.to_timestamp())
     annual_simple = annual_simple.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
@@ -629,10 +622,8 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         how="left",
     )
 
-    # Month-end cutoffs
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
-    # Valid till
     deals_dedup["Monthly Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"].apply(_add_month)
     deals_dedup["Annual Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].apply(_add_year)
 
@@ -650,13 +641,9 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
-    # Upsell rules
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
-    # If no previous month payment. upsell is 0
-    # If churned this month. upsell is 0
-    # If annual user. ignore upsell
     is_annual_user_asof = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].notna()
     eligible = (prev_amt > 0) & (~deals_dedup["Churned (AsOf MonthEnd)"]) & (~is_annual_user_asof)
 
@@ -674,17 +661,6 @@ def make_excel(deals_raw: pd.DataFrame, deals_enriched: pd.DataFrame, summary_al
         summary_all.to_excel(writer, sheet_name="Summary_all", index=False)
         summary_connected.to_excel(writer, sheet_name="Summary_connected", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
-
-        audit_rows = [
-            ("Deals rows raw", len(deals_raw)),
-            ("Deals rows enriched (deduped)", len(deals_enriched)),
-            ("Deals connected TRUE", int((deals_enriched["Connected"] == True).sum())),
-            ("Deals annual active (AsOf MonthEnd)", int(deals_enriched["Annual Active (AsOf MonthEnd)"].fillna(False).sum())),
-            ("Deals churned (AsOf MonthEnd)", int(deals_enriched["Churned (AsOf MonthEnd)"].fillna(True).sum())),
-            ("Rows with Amount Breakdown present", int(deals_enriched.get("Amount Breakdown", pd.Series([pd.NA]*len(deals_enriched))).notna().sum()) if "Amount Breakdown" in deals_enriched.columns else 0),
-        ]
-        pd.DataFrame(audit_rows, columns=["Metric", "Value"]).to_excel(writer, sheet_name="Audit", index=False)
-
     return output.getvalue()
 
 
