@@ -33,6 +33,9 @@ ANNUAL_AMOUNT_THRESHOLD = 40.0
 ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
 
 
+# -------------------------
+# Secrets and Auth
+# -------------------------
 def _require_secrets():
     missing = []
 
@@ -58,6 +61,37 @@ def _require_secrets():
         st.stop()
 
 
+def login_gate() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown(
+        """
+        <div style="padding:14px;border-radius:16px;border:1px solid rgba(0,0,0,0.08);
+                    background:linear-gradient(90deg, rgba(141,52,240,0.10), rgba(234,102,255,0.10), rgba(133,72,255,0.10));">
+          <div style="font-size:1.1rem;font-weight:900;">Login</div>
+          <div style="opacity:0.8;margin-top:4px;">Enter credentials to access the dashboard.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    u = st.text_input("Username", value="", key="login_user")
+    p = st.text_input("Password", value="", type="password", key="login_pass")
+
+    if st.button("Sign in", type="primary"):
+        if u == str(st.secrets["auth"]["username"]) and p == str(st.secrets["auth"]["password"]):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    return False
+
+
+# -------------------------
+# Branding
+# -------------------------
 def inject_brand_css():
     css = f"""
     <style>
@@ -121,34 +155,9 @@ def render_header():
         )
 
 
-def login_gate() -> bool:
-    if st.session_state.get("authenticated"):
-        return True
-
-    st.markdown(
-        """
-        <div style="padding:14px;border-radius:16px;border:1px solid rgba(0,0,0,0.08);
-                    background:linear-gradient(90deg, rgba(141,52,240,0.10), rgba(234,102,255,0.10), rgba(133,72,255,0.10));">
-          <div style="font-size:1.1rem;font-weight:900;">Login</div>
-          <div style="opacity:0.8;margin-top:4px;">Enter credentials to access the dashboard.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    u = st.text_input("Username", value="", key="login_user")
-    p = st.text_input("Password", value="", type="password", key="login_pass")
-
-    if st.button("Sign in", type="primary"):
-        if u == str(st.secrets["auth"]["username"]) and p == str(st.secrets["auth"]["password"]):
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-    return False
-
-
+# -------------------------
+# Utilities
+# -------------------------
 def _normalize_email(v):
     if v is None:
         return None
@@ -172,7 +181,7 @@ def _prop_any(props: dict, keys: list[str]):
     return None
 
 
-def _time_to_epoch_seconds(v) -> int | None:
+def _time_to_epoch_seconds(v):
     if v is None:
         return None
     try:
@@ -260,8 +269,20 @@ def _clean_breakdown_str(x) -> str:
     return s
 
 
+def _dt_to_date_only(x):
+    if pd.isna(x):
+        return pd.NaT
+    try:
+        return pd.Timestamp(x).date()
+    except Exception:
+        return pd.NaT
+
+
+# -------------------------
+# Mixpanel fetch. Reduced columns
+# -------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=3)
-def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
+def fetch_mixpanel_npm(to_date: date):
     mp = st.secrets["mixpanel"]
     project_id = str(mp["project_id"]).strip()
     from_date = str(mp["from_date"]).strip()
@@ -279,12 +300,9 @@ def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
         f"&event={event_array_json}"
     )
 
-    headers = {
-        "accept": "text/plain",
-        "authorization": str(mp["auth_header"]).strip(),
-    }
+    headers = {"accept": "text/plain", "authorization": str(mp["auth_header"]).strip()}
 
-    kept: dict[tuple, tuple[int | None, dict]] = {}
+    kept = {}
     stats = {
         "lines_read": 0,
         "rows_kept_prefilter": 0,
@@ -329,7 +347,6 @@ def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
             distinct_id = rec.get("distinct_id")
             insert_id = rec.get("$insert_id")
             time_s = _time_to_epoch_seconds(rec.get("time"))
-
             if event is None or distinct_id is None or insert_id is None or time_s is None:
                 continue
 
@@ -366,7 +383,29 @@ def fetch_mixpanel_npm(to_date: date) -> tuple[pd.DataFrame, dict]:
     return df, stats
 
 
-def summarize(deals_enriched: pd.DataFrame, connected_only: bool) -> pd.DataFrame:
+# -------------------------
+# Summary tables
+# -------------------------
+def _agg_metrics(g: pd.DataFrame) -> pd.Series:
+    total = len(g)
+    churn = int(g["Churned (AsOf MonthEnd)"].fillna(True).sum())
+    churn_pct = (churn / total) if total else np.nan
+    upsell_sum = float(g["Upsell Net Change"].fillna(0).sum())
+    upsell_pos_sum = float(g["Upsell Positive Only"].fillna(0).sum())
+    annual_active = int(g["Annual Active (AsOf MonthEnd)"].fillna(False).sum())
+    return pd.Series(
+        {
+            "Accounts": total,
+            "Churned": churn,
+            "Churn %": churn_pct,
+            "Annual Active": annual_active,
+            "Upsell Net Change Sum": upsell_sum,
+            "Upsell Positive Only Sum": upsell_pos_sum,
+        }
+    )
+
+
+def summarize_basic(deals_enriched: pd.DataFrame, connected_only: bool) -> pd.DataFrame:
     df = deals_enriched.copy()
     if connected_only:
         df = df[df["Connected"] == True].copy()
@@ -375,30 +414,12 @@ def summarize(deals_enriched: pd.DataFrame, connected_only: bool) -> pd.DataFram
     if df.empty:
         return pd.DataFrame()
 
-    def _agg(g: pd.DataFrame) -> pd.Series:
-        total = len(g)
-        churn = int(g["Churned (AsOf MonthEnd)"].fillna(True).sum())
-        churn_pct = (churn / total) if total else np.nan
-        upsell_sum = float(g["Upsell Net Change"].fillna(0).sum())
-        upsell_pos_sum = float(g["Upsell Positive Only"].fillna(0).sum())
-        annual_active = int(g["Annual Active (AsOf MonthEnd)"].fillna(False).sum())
-        return pd.Series(
-            {
-                "Accounts": total,
-                "Churned": churn,
-                "Churn %": churn_pct,
-                "Annual Active": annual_active,
-                "Upsell Net Change Sum": upsell_sum,
-                "Upsell Positive Only Sum": upsell_pos_sum,
-            }
-        )
-
-    overall = df.groupby("DealMonth", as_index=False).apply(_agg).reset_index(drop=True)
+    overall = df.groupby("DealMonth", as_index=False).apply(_agg_metrics).reset_index(drop=True)
     overall["Scope"] = "Overall"
     overall["Deal Owner"] = "All"
 
     if "Deal - Owner" in df.columns:
-        by_owner = df.groupby(["DealMonth", "Deal - Owner"], as_index=False).apply(_agg).reset_index(drop=True)
+        by_owner = df.groupby(["DealMonth", "Deal - Owner"], as_index=False).apply(_agg_metrics).reset_index(drop=True)
         by_owner = by_owner.rename(columns={"Deal - Owner": "Deal Owner"})
         by_owner["Scope"] = "By Owner"
     else:
@@ -409,7 +430,28 @@ def summarize(deals_enriched: pd.DataFrame, connected_only: bool) -> pd.DataFram
     return out
 
 
-def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def summarize_owner_connected_status(deals_enriched: pd.DataFrame) -> pd.DataFrame:
+    df = deals_enriched.copy()
+    df = df[df["DealMonth"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    if "Deal - Owner" not in df.columns:
+        df["Deal - Owner"] = "Unknown"
+    if "Deal - Status" not in df.columns:
+        df["Deal - Status"] = pd.NA
+
+    group_cols = ["DealMonth", "Deal - Owner", "Connected", "Deal - Status"]
+    out = df.groupby(group_cols, as_index=False).apply(_agg_metrics).reset_index(drop=True)
+    out = out.rename(columns={"Deal - Owner": "Deal Owner", "Deal - Status": "Deal Status"})
+    out = out.sort_values(["DealMonth", "Deal Owner", "Connected", "Deal Status"], kind="mergesort")
+    return out
+
+
+# -------------------------
+# Core enrichment
+# -------------------------
+def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deal_date_col = "Deal - Deal created on"
     deal_email_col = "Person - Email"
     deal_owner_col = "Deal - Owner"
@@ -421,7 +463,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         raise KeyError(f"Deals file missing columns: {missing}")
 
     deals = deals_df.copy()
-
     deals["_deal_created_dt"] = pd.to_datetime(deals[deal_date_col], errors="coerce", utc=True).dt.tz_convert(None)
     if deals["_deal_created_dt"].isna().all():
         deals["_deal_created_dt"] = pd.to_datetime(deals[deal_date_col], errors="coerce")
@@ -455,19 +496,17 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
 
     if npm_df is None or npm_df.empty:
         out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
-        return out, summarize(out, False), summarize(out, True)
+        summary_all = summarize_basic(out, False)
+        summary_connected = summarize_basic(out, True)
+        summary_owner_cs = summarize_owner_connected_status(out)
+        return out, summary_all, summary_connected, summary_owner_cs
 
     npm = npm_df.copy()
     npm = npm.loc[:, ~npm.columns.duplicated()].copy()
 
-    if "Amount Breakdown" not in npm.columns:
-        npm["Amount Breakdown"] = pd.NA
-    if "Amount Breakdown by Unit" not in npm.columns:
-        npm["Amount Breakdown by Unit"] = pd.NA
-    if "Amount Description" not in npm.columns:
-        npm["Amount Description"] = pd.NA
-    if "$email" not in npm.columns:
-        npm["$email"] = pd.NA
+    for col in ["Amount Breakdown", "Amount Breakdown by Unit", "Amount Description", "$email"]:
+        if col not in npm.columns:
+            npm[col] = pd.NA
     if "time" not in npm.columns:
         raise KeyError("Mixpanel export missing required column: time")
     if "Amount" not in npm.columns:
@@ -479,29 +518,25 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
 
     npm["EmailKey"] = npm["$email"].map(_normalize_email)
     npm["EmailKey"] = npm["EmailKey"].fillna(npm["Amount Description"].map(_extract_email_from_text))
-
     npm_valid = npm.dropna(subset=["EmailKey", "PayDT"]).copy()
 
     desc = npm_valid["Amount Description"].astype(str)
     desc_lower = desc.str.lower().str.strip()
     breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
 
-    # Annual detection additions:
-    # - annual start: amount>40 AND (contains "workspace subscription" OR exact "upgrade plan to yearly subscription.")
+    # Annual start also includes "Upgrade plan to yearly subscription."
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         desc_lower.str.contains("workspace subscription", na=False)
         | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
     )
 
     desc_no_comma = ~desc.str.contains(",", na=False)
-
     contains_email = pd.Series(
         [(e in d) if (e and isinstance(d, str)) else False for e, d in zip(npm_valid["EmailKey"], desc_lower)],
         index=npm_valid.index,
     )
 
     breakdown_mask = breakdown_clean.apply(lambda x: any(n in x for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS))
-
     annual_renew = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         (contains_email & desc_no_comma) | breakdown_mask
     )
@@ -510,14 +545,15 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     annual_candidates["Annual Payment Type"] = np.where(
         annual_start.loc[annual_candidates.index], "Subscription", "Renew"
     )
-
     annual_user_set = set(annual_candidates["EmailKey"].unique())
 
+    # Renewal payments mapping
     cond_email_in_desc = contains_email
     cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
     cond_workspace_sub = desc_lower.str.contains("workspace subscription", na=False)
 
+    # Number Renew mapping only for annual users
     cond_number_renew_for_mapping = desc_lower.str.contains("number renew", na=False) & npm_valid["EmailKey"].isin(annual_user_set)
 
     renewal_mask = (
@@ -528,7 +564,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         | cond_number_renew_for_mapping
     )
     renewals = npm_valid[renewal_mask].copy()
-
     renewals_sorted = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
 
     txn_count = (
@@ -551,6 +586,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         except Exception:
             return default
 
+    # Amounts
     deals_dedup["Current Month Renew Amount"] = [
         float(_map_from_latest(e, m, "AmountNum", np.nan)) if pd.notna(_map_from_latest(e, m, "AmountNum", np.nan)) else np.nan
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -560,13 +596,29 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
+    # Dates. Date-only (no time)
+    deals_dedup["Current Month Renew Date"] = [
+        _map_from_latest(e, m, "PayDT", pd.NaT)
+        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
+    ]
+    deals_dedup["Previous Month Renew Date"] = [
+        _map_from_latest(e, m, "PayDT", pd.NaT)
+        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
+    ]
+    deals_dedup["Current Month Renew Date"] = deals_dedup["Current Month Renew Date"].apply(_dt_to_date_only)
+    deals_dedup["Previous Month Renew Date"] = deals_dedup["Previous Month Renew Date"].apply(_dt_to_date_only)
+
+    # Flags
     deals_dedup["Current Month Renew Multiple Flag"] = [
-        bool(_map_from_latest(e, m, "Renew Multiple Flag", False)) for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
+        bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
+        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
     ]
     deals_dedup["Previous Month Renew Multiple Flag"] = [
-        bool(_map_from_latest(e, m, "Renew Multiple Flag", False)) for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
+        bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
+        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
+    # Deal-month index for validity rolling
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -574,6 +626,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         .sort_values(["EmailKey", "DealMonth"], kind="mergesort")
     )
 
+    # Monthly validity should NOT be extended by Number Renew
     renewals_for_validity = renewals.copy()
     renewals_for_validity = renewals_for_validity[
         ~renewals_for_validity["Amount Description"].astype(str).str.contains("number renew", case=False, na=False)
@@ -597,6 +650,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         how="left",
     )
 
+    # Annual rolling
     annual_simple = annual_candidates.dropna(subset=["EmailKey", "PayDT"]).copy()
     annual_simple = annual_simple.assign(PayMonth=annual_simple["PayDT"].dt.to_period("M").dt.to_timestamp())
     annual_simple = annual_simple.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
@@ -604,10 +658,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     annual_latest_in_month = annual_simple.drop_duplicates(
         subset=["EmailKey", "PayMonth"], keep="last"
     )[["EmailKey", "PayMonth", "PayDT", "Annual Payment Type"]].copy()
-
-    annual_latest_in_month = annual_latest_in_month.rename(
-        columns={"PayMonth": "DealMonth", "PayDT": "Annual PayDT In Month"}
-    )
+    annual_latest_in_month = annual_latest_in_month.rename(columns={"PayMonth": "DealMonth", "PayDT": "Annual PayDT In Month"})
 
     annual_roll = (
         deal_month_index.merge(annual_latest_in_month, on=["EmailKey", "DealMonth"], how="left")
@@ -622,8 +673,10 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
         how="left",
     )
 
+    # Month-end cutoffs
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
+    # Valid till
     deals_dedup["Monthly Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"].apply(_add_month)
     deals_dedup["Annual Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].apply(_add_year)
 
@@ -641,6 +694,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
+    # Upsell rules
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
@@ -651,15 +705,19 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame) -> tuple[
     deals_dedup["Upsell Positive Only"] = np.where(deals_dedup["Upsell Net Change"] > 0, deals_dedup["Upsell Net Change"], 0.0)
 
     out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
-    return out, summarize(out, False), summarize(out, True)
+    summary_all = summarize_basic(out, False)
+    summary_connected = summarize_basic(out, True)
+    summary_owner_cs = summarize_owner_connected_status(out)
+    return out, summary_all, summary_connected, summary_owner_cs
 
 
-def make_excel(deals_raw: pd.DataFrame, deals_enriched: pd.DataFrame, summary_all: pd.DataFrame, summary_connected: pd.DataFrame) -> bytes:
+def make_excel(deals_raw: pd.DataFrame, deals_enriched: pd.DataFrame, summary_all: pd.DataFrame, summary_connected: pd.DataFrame, summary_owner_cs: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         deals_enriched.to_excel(writer, sheet_name="Deals_enriched", index=False)
         summary_all.to_excel(writer, sheet_name="Summary_all", index=False)
         summary_connected.to_excel(writer, sheet_name="Summary_connected", index=False)
+        summary_owner_cs.to_excel(writer, sheet_name="Summary_owner_connected_status", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
     return output.getvalue()
 
@@ -730,7 +788,7 @@ def main():
     st.sidebar.write(stats)
 
     with st.spinner("Building enriched dataset..."):
-        deals_enriched, summary_all, summary_connected = build_enriched_deals(deals_raw, npm_df)
+        deals_enriched, summary_all, summary_connected, summary_owner_cs = build_enriched_deals(deals_raw, npm_df)
 
     summary_view = summary_connected if focus_connected else summary_all
     kpi_row(summary_view)
@@ -740,8 +798,12 @@ def main():
     with tab1:
         st.subheader("All deals")
         st.dataframe(summary_all, use_container_width=True)
+
         st.subheader("Connected only")
         st.dataframe(summary_connected, use_container_width=True)
+
+        st.subheader("Owner + Connected + Deal Status breakdown")
+        st.dataframe(summary_owner_cs, use_container_width=True)
 
     with tab2:
         overall = summary_view[summary_view["Scope"] == "Overall"].copy() if not summary_view.empty else pd.DataFrame()
@@ -766,7 +828,7 @@ def main():
 
     st.divider()
     st.subheader("Export")
-    excel_bytes = make_excel(deals_raw, deals_enriched, summary_all, summary_connected)
+    excel_bytes = make_excel(deals_raw, deals_enriched, summary_all, summary_connected, summary_owner_cs)
     st.download_button(
         "Download Excel workbook",
         data=excel_bytes,
