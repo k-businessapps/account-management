@@ -15,7 +15,7 @@ except Exception:
 
 
 APP_TITLE = "Account Management"
-APP_SUBTITLE = "Upsells and churn computed at month-end. Monthly and annual validity supported."
+APP_SUBTITLE = "Upsell and Churn KPI Calculation"
 
 KC_LIGHT_PINKISH_PURPLE = "#F4B7FF"
 KC_VIBRANT_MAGENTA = "#EA66FF"
@@ -143,11 +143,6 @@ def render_header():
               <div>
                 <div style="font-size:1.25rem;font-weight:900;line-height:1.2;">{APP_TITLE}</div>
                 <div style="opacity:0.85;margin-top:2px;">{APP_SUBTITLE}</div>
-              </div>
-              <div style="margin-left:auto;padding:6px 10px;border-radius:999px;
-                          background:rgba(133,72,255,0.12);border:1px solid rgba(133,72,255,0.18);
-                          font-weight:800;font-size:0.85rem;">
-                KrispCall branded
               </div>
             </div>
             """,
