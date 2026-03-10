@@ -1,7 +1,7 @@
 import re
 import json
 from io import BytesIO
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -568,7 +568,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     desc_lower = desc.str.lower().str.strip()
     breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
 
-    # Annual detection
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         desc_lower.str.contains("workspace subscription", na=False)
         | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
@@ -590,7 +589,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         annual_start.loc[annual_candidates.index], "Subscription", "Renew"
     )
 
-    # Renewal mapping
     cond_email_in_desc = contains_email
     cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
@@ -628,7 +626,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         except Exception:
             return default
 
-    # Amounts
     deals_dedup["Current Month Renew Amount"] = [
         float(_map_from_latest(e, m, "AmountNum", np.nan)) if pd.notna(_map_from_latest(e, m, "AmountNum", np.nan)) else np.nan
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -638,7 +635,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Dates
     deals_dedup["Current Month Renew Date"] = [
         _map_from_latest(e, m, "PayDT", pd.NaT)
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -650,7 +646,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deals_dedup["Current Month Renew Date"] = deals_dedup["Current Month Renew Date"].apply(_dt_to_date_only)
     deals_dedup["Previous Month Renew Date"] = deals_dedup["Previous Month Renew Date"].apply(_dt_to_date_only)
 
-    # Flags
     deals_dedup["Current Month Renew Multiple Flag"] = [
         bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -660,7 +655,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Deal-month index for rolling validity
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -668,10 +662,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         .sort_values(["EmailKey", "DealMonth"], kind="mergesort")
     )
 
-    # Monthly validity
-    # Important fix.
-    # Use ALL mapped renewal rows here, including "number renew".
-    # If a user paid in the current month, they should not be churned as of month end.
     valid_sorted = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
     valid_latest_in_month = valid_sorted.drop_duplicates(
         subset=["EmailKey", "PayMonth"], keep="last"
@@ -692,7 +682,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
-    # Annual rolling
     annual_simple = annual_candidates.dropna(subset=["EmailKey", "PayDT"]).copy()
     annual_simple = annual_simple.assign(PayMonth=annual_simple["PayDT"].dt.to_period("M").dt.to_timestamp())
     annual_simple = annual_simple.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
@@ -717,10 +706,33 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
-    # Month-end cutoff
+    # -------------------------------------------------
+    # Critical churn fix.
+    # If Current Month Renew Date exists inside the same DealMonth,
+    # force it into Latest Monthly PayDT when the roll missed it.
+    # Then forward fill again by EmailKey.
+    # -------------------------------------------------
+    deals_dedup["Current Month Renew DT Fallback"] = pd.to_datetime(
+        deals_dedup["Current Month Renew Date"], errors="coerce"
+    )
+
+    same_month_fallback_mask = (
+        deals_dedup["Current Month Renew DT Fallback"].notna()
+        & (deals_dedup["Current Month Renew DT Fallback"].dt.to_period("M").dt.to_timestamp() == deals_dedup["DealMonth"])
+    )
+
+    deals_dedup.loc[same_month_fallback_mask, "Latest Monthly PayDT (AsOf MonthEnd)"] = (
+        deals_dedup.loc[same_month_fallback_mask, "Latest Monthly PayDT (AsOf MonthEnd)"]
+        .combine_first(deals_dedup.loc[same_month_fallback_mask, "Current Month Renew DT Fallback"])
+    )
+
+    deals_dedup = deals_dedup.sort_values(["EmailKey", "DealMonth"], kind="mergesort")
+    deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"] = (
+        deals_dedup.groupby("EmailKey")["Latest Monthly PayDT (AsOf MonthEnd)"].ffill()
+    )
+
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
-    # Valid till
     deals_dedup["Monthly Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"].apply(_add_month)
     deals_dedup["Annual Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].apply(_add_year)
 
@@ -738,7 +750,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
-    # Upsell
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
@@ -747,6 +758,8 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals_dedup["Upsell Net Change"] = np.where(eligible, (curr_amt - prev_amt), 0.0)
     deals_dedup["Upsell Positive Only"] = np.where(deals_dedup["Upsell Net Change"] > 0, deals_dedup["Upsell Net Change"], 0.0)
+
+    deals_dedup = deals_dedup.drop(columns=["Current Month Renew DT Fallback"], errors="ignore")
 
     out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
     summary_all = summarize_basic(out, False)
