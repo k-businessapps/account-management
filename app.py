@@ -1,7 +1,7 @@
 import re
 import json
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -297,6 +297,13 @@ def _dt_to_date_only(x):
         return pd.NaT
 
 
+def _safe_parse_date(v):
+    try:
+        return pd.to_datetime(v).date()
+    except Exception:
+        return None
+
+
 # -------------------------
 # Mixpanel fetch. Reduced columns
 # -------------------------
@@ -304,7 +311,16 @@ def _dt_to_date_only(x):
 def fetch_mixpanel_npm(to_date: date):
     mp = st.secrets["mixpanel"]
     project_id = str(mp["project_id"]).strip()
-    from_date = str(mp["from_date"]).strip()
+
+    configured_from_date = _safe_parse_date(str(mp["from_date"]).strip())
+    min_annual_lookback_date = to_date - timedelta(days=400)
+
+    if configured_from_date is None:
+        effective_from_date = min_annual_lookback_date
+    else:
+        effective_from_date = min(configured_from_date, min_annual_lookback_date)
+
+    from_date = effective_from_date.isoformat()
     to_date_str = to_date.isoformat()
 
     events = ["New Payment Made"]
@@ -323,6 +339,8 @@ def fetch_mixpanel_npm(to_date: date):
 
     kept = {}
     stats = {
+        "from_date_used": from_date,
+        "to_date_used": to_date_str,
         "lines_read": 0,
         "rows_kept_prefilter": 0,
         "rows_dedup_final": 0,
@@ -550,6 +568,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     desc_lower = desc.str.lower().str.strip()
     breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
 
+    # Annual detection
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         desc_lower.str.contains("workspace subscription", na=False)
         | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
@@ -570,21 +589,22 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     annual_candidates["Annual Payment Type"] = np.where(
         annual_start.loc[annual_candidates.index], "Subscription", "Renew"
     )
-    annual_user_set = set(annual_candidates["EmailKey"].unique())
 
+    # Renewal mapping
     cond_email_in_desc = contains_email
     cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
     cond_workspace_sub = desc_lower.str.contains("workspace subscription", na=False)
-    cond_number_renew_for_mapping = desc_lower.str.contains("number renew", na=False) & npm_valid["EmailKey"].isin(annual_user_set)
+    cond_number_renew = desc_lower.str.contains("number renew", na=False)
 
     renewal_mask = (
         cond_email_in_desc
         | cond_number_purchased
         | cond_agent_added
         | cond_workspace_sub
-        | cond_number_renew_for_mapping
+        | cond_number_renew
     )
+
     renewals = npm_valid[renewal_mask].copy()
     renewals_sorted = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
 
@@ -608,6 +628,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         except Exception:
             return default
 
+    # Amounts
     deals_dedup["Current Month Renew Amount"] = [
         float(_map_from_latest(e, m, "AmountNum", np.nan)) if pd.notna(_map_from_latest(e, m, "AmountNum", np.nan)) else np.nan
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -617,6 +638,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
+    # Dates
     deals_dedup["Current Month Renew Date"] = [
         _map_from_latest(e, m, "PayDT", pd.NaT)
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -628,6 +650,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deals_dedup["Current Month Renew Date"] = deals_dedup["Current Month Renew Date"].apply(_dt_to_date_only)
     deals_dedup["Previous Month Renew Date"] = deals_dedup["Previous Month Renew Date"].apply(_dt_to_date_only)
 
+    # Flags
     deals_dedup["Current Month Renew Multiple Flag"] = [
         bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -637,6 +660,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
+    # Deal-month index for rolling validity
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -644,16 +668,17 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         .sort_values(["EmailKey", "DealMonth"], kind="mergesort")
     )
 
-    renewals_for_validity = renewals.copy()
-    renewals_for_validity = renewals_for_validity[
-        ~renewals_for_validity["Amount Description"].astype(str).str.contains("number renew", case=False, na=False)
-    ].copy()
-
-    valid_sorted = renewals_for_validity.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
+    # Monthly validity
+    # Important fix.
+    # Use ALL mapped renewal rows here, including "number renew".
+    # If a user paid in the current month, they should not be churned as of month end.
+    valid_sorted = renewals.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
     valid_latest_in_month = valid_sorted.drop_duplicates(
         subset=["EmailKey", "PayMonth"], keep="last"
     )[["EmailKey", "PayMonth", "PayDT"]].copy()
-    valid_latest_in_month = valid_latest_in_month.rename(columns={"PayMonth": "DealMonth", "PayDT": "Monthly PayDT In Month"})
+    valid_latest_in_month = valid_latest_in_month.rename(
+        columns={"PayMonth": "DealMonth", "PayDT": "Monthly PayDT In Month"}
+    )
 
     monthly_roll = (
         deal_month_index.merge(valid_latest_in_month, on=["EmailKey", "DealMonth"], how="left")
@@ -667,6 +692,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
+    # Annual rolling
     annual_simple = annual_candidates.dropna(subset=["EmailKey", "PayDT"]).copy()
     annual_simple = annual_simple.assign(PayMonth=annual_simple["PayDT"].dt.to_period("M").dt.to_timestamp())
     annual_simple = annual_simple.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
@@ -674,7 +700,9 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     annual_latest_in_month = annual_simple.drop_duplicates(
         subset=["EmailKey", "PayMonth"], keep="last"
     )[["EmailKey", "PayMonth", "PayDT", "Annual Payment Type"]].copy()
-    annual_latest_in_month = annual_latest_in_month.rename(columns={"PayMonth": "DealMonth", "PayDT": "Annual PayDT In Month"})
+    annual_latest_in_month = annual_latest_in_month.rename(
+        columns={"PayMonth": "DealMonth", "PayDT": "Annual PayDT In Month"}
+    )
 
     annual_roll = (
         deal_month_index.merge(annual_latest_in_month, on=["EmailKey", "DealMonth"], how="left")
@@ -689,8 +717,10 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
+    # Month-end cutoff
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
+    # Valid till
     deals_dedup["Monthly Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"].apply(_add_month)
     deals_dedup["Annual Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].apply(_add_year)
 
@@ -708,6 +738,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
+    # Upsell
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
@@ -775,7 +806,7 @@ def main():
         return
 
     end_date = st.sidebar.date_input("Payments to date", value=date.today())
-    st.sidebar.caption("Mixpanel Export API. Start date comes from secrets mixpanel.from_date.")
+    st.sidebar.caption("Mixpanel Export API. A minimum annual-history lookback is applied automatically.")
     deals_file = st.sidebar.file_uploader("Upload Deals CSV", type=["csv"])
     fetch_btn = st.sidebar.button("Fetch payments", type="primary")
     focus_connected = st.sidebar.toggle("Connected only view", value=False)
