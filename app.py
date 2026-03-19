@@ -550,13 +550,49 @@ def summarize_basic(deals_enriched: pd.DataFrame, connected_only: bool) -> pd.Da
     if df.empty:
         return pd.DataFrame()
 
-    overall = df.groupby("DealMonth", as_index=False).apply(_agg_metrics).reset_index(drop=True)
+    overall = (
+        df.groupby("DealMonth", dropna=False)
+        .agg(
+            Accounts=("DealMonth", "size"),
+            Churned=("Churned (AsOf MonthEnd)", lambda s: int(s.fillna(True).sum())),
+            Annual_Active=("Annual Active (AsOf MonthEnd)", lambda s: int(s.fillna(False).sum())),
+            Upsell_Net_Change_Sum=("Upsell Net Change", lambda s: float(s.fillna(0).sum())),
+            Upsell_Positive_Only_Sum=("Upsell Positive Only", lambda s: float(s.fillna(0).sum())),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Annual_Active": "Annual Active",
+                "Upsell_Net_Change_Sum": "Upsell Net Change Sum",
+                "Upsell_Positive_Only_Sum": "Upsell Positive Only Sum",
+            }
+        )
+    )
+    overall["Churn %"] = np.where(overall["Accounts"] > 0, overall["Churned"] / overall["Accounts"], np.nan)
     overall["Scope"] = "Overall"
     overall["Deal Owner"] = "All"
 
     if "Deal - Owner" in df.columns:
-        by_owner = df.groupby(["DealMonth", "Deal - Owner"], as_index=False).apply(_agg_metrics).reset_index(drop=True)
-        by_owner = by_owner.rename(columns={"Deal - Owner": "Deal Owner"})
+        by_owner = (
+            df.groupby(["DealMonth", "Deal - Owner"], dropna=False)
+            .agg(
+                Accounts=("DealMonth", "size"),
+                Churned=("Churned (AsOf MonthEnd)", lambda s: int(s.fillna(True).sum())),
+                Annual_Active=("Annual Active (AsOf MonthEnd)", lambda s: int(s.fillna(False).sum())),
+                Upsell_Net_Change_Sum=("Upsell Net Change", lambda s: float(s.fillna(0).sum())),
+                Upsell_Positive_Only_Sum=("Upsell Positive Only", lambda s: float(s.fillna(0).sum())),
+            )
+            .reset_index()
+            .rename(
+                columns={
+                    "Deal - Owner": "Deal Owner",
+                    "Annual_Active": "Annual Active",
+                    "Upsell_Net_Change_Sum": "Upsell Net Change Sum",
+                    "Upsell_Positive_Only_Sum": "Upsell Positive Only Sum",
+                }
+            )
+        )
+        by_owner["Churn %"] = np.where(by_owner["Accounts"] > 0, by_owner["Churned"] / by_owner["Accounts"], np.nan)
         by_owner["Scope"] = "By Owner"
     else:
         by_owner = pd.DataFrame()
@@ -578,8 +614,27 @@ def summarize_owner_connected_status(deals_enriched: pd.DataFrame) -> pd.DataFra
         df["Deal - Status"] = pd.NA
 
     group_cols = ["DealMonth", "Deal - Owner", "Connected", "Deal - Status"]
-    out = df.groupby(group_cols, as_index=False).apply(_agg_metrics).reset_index(drop=True)
-    out = out.rename(columns={"Deal - Owner": "Deal Owner", "Deal - Status": "Deal Status"})
+    out = (
+        df.groupby(group_cols, dropna=False)
+        .agg(
+            Accounts=("DealMonth", "size"),
+            Churned=("Churned (AsOf MonthEnd)", lambda s: int(s.fillna(True).sum())),
+            Annual_Active=("Annual Active (AsOf MonthEnd)", lambda s: int(s.fillna(False).sum())),
+            Upsell_Net_Change_Sum=("Upsell Net Change", lambda s: float(s.fillna(0).sum())),
+            Upsell_Positive_Only_Sum=("Upsell Positive Only", lambda s: float(s.fillna(0).sum())),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Deal - Owner": "Deal Owner",
+                "Deal - Status": "Deal Status",
+                "Annual_Active": "Annual Active",
+                "Upsell_Net_Change_Sum": "Upsell Net Change Sum",
+                "Upsell_Positive_Only_Sum": "Upsell Positive Only Sum",
+            }
+        )
+    )
+    out["Churn %"] = np.where(out["Accounts"] > 0, out["Churned"] / out["Accounts"], np.nan)
     out = out.sort_values(["DealMonth", "Deal Owner", "Connected", "Deal Status"], kind="mergesort")
     return out
 
@@ -986,8 +1041,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     return out, summary_all, summary_connected, summary_owner_cs, debug_frames
 
 
-def make_excel(
-    deals_raw: pd.DataFrame,
+def make_debug_export_csv(
     deals_enriched: pd.DataFrame,
     summary_all: pd.DataFrame,
     summary_connected: pd.DataFrame,
@@ -995,28 +1049,39 @@ def make_excel(
     mixpanel_stats: dict | None = None,
     debug_frames: dict | None = None,
 ) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        deals_enriched.to_excel(writer, sheet_name="Deals_enriched", index=False)
-        summary_all.to_excel(writer, sheet_name="Summary_all", index=False)
-        summary_connected.to_excel(writer, sheet_name="Summary_connected", index=False)
-        summary_owner_cs.to_excel(writer, sheet_name="Summary_owner_connected_status", index=False)
-        deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
+    parts = []
 
-        stats_df = pd.DataFrame(
-            [{"metric": k, "value": v} for k, v in (mixpanel_stats or {}).items()]
-        )
-        stats_df.to_excel(writer, sheet_name="Mixpanel_fetch_stats", index=False)
+    stats_df = pd.DataFrame([{"metric": k, "value": v} for k, v in (mixpanel_stats or {}).items()])
+    if not stats_df.empty:
+        stats_df = stats_df.copy()
+        stats_df.insert(0, "ExportSection", "Mixpanel_fetch_stats")
+        parts.append(stats_df)
 
-        if debug_frames:
-            for sheet_name, df in debug_frames.items():
-                safe_sheet_name = str(sheet_name)[:31]
-                if df is None:
-                    pd.DataFrame().to_excel(writer, sheet_name=safe_sheet_name, index=False)
-                else:
-                    df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+    base_sections = [
+        ("Summary_all", summary_all),
+        ("Summary_connected", summary_connected),
+        ("Summary_owner_connected_status", summary_owner_cs),
+        ("Deals_enriched", deals_enriched),
+    ]
+    for section_name, df in base_sections:
+        if df is not None and not df.empty:
+            tmp = df.copy()
+            tmp.insert(0, "ExportSection", section_name)
+            parts.append(tmp)
 
-    return output.getvalue()
+    if debug_frames:
+        for section_name, df in debug_frames.items():
+            if df is not None and not df.empty:
+                tmp = df.copy()
+                tmp.insert(0, "ExportSection", str(section_name))
+                parts.append(tmp)
+
+    if not parts:
+        export_df = pd.DataFrame({"ExportSection": ["empty"], "message": ["No data available"]})
+    else:
+        export_df = pd.concat(parts, ignore_index=True, sort=False)
+
+    return export_df.to_csv(index=False).encode("utf-8")
 
 
 def kpi_row(summary_df: pd.DataFrame):
@@ -1165,8 +1230,7 @@ def main():
 
     st.divider()
     st.subheader("Export")
-    excel_bytes = make_excel(
-        deals_raw,
+    csv_bytes = make_debug_export_csv(
         deals_enriched,
         summary_all,
         summary_connected,
@@ -1175,10 +1239,10 @@ def main():
         debug_frames=debug_frames,
     )
     st.download_button(
-        "Download Excel workbook",
-        data=excel_bytes,
-        file_name="account_mgmt_upsell_churn_enriched_debug.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Download diagnostic CSV",
+        data=csv_bytes,
+        file_name="account_mgmt_debug_export.csv",
+        mime="text/csv",
     )
 
 
