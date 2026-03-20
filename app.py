@@ -42,10 +42,7 @@ def init_state():
         "authenticated": False,
         "npm_cached": None,
         "npm_stats": None,
-        "npm_fetch_diag": None,
         "last_fetch_to_date": None,
-        "excel_export_bytes": None,
-        "excel_export_ready": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -435,7 +432,6 @@ def fetch_mixpanel_npm(to_date):
     headers = {"accept": "text/plain", "authorization": str(mp["auth_header"]).strip()}
 
     kept = {}
-    fetch_diag_rows = []
     stats = {
         "from_date_used": from_date,
         "to_date_used": to_date_str,
@@ -464,32 +460,8 @@ def fetch_mixpanel_npm(to_date):
             breakdown_source = f"{'' if amount_breakdown is None else amount_breakdown} {' ' if amount_breakdown_by_unit is not None else ''}{'' if amount_breakdown_by_unit is None else amount_breakdown_by_unit}"
             breakdown_clean = _clean_breakdown_str(breakdown_source)
             desc_lower = str(amount_desc).lower().strip() if amount_desc is not None else ""
-            extracted_email = _extract_email_from_text(amount_desc)
-            prefilter_keep = _row_is_candidate(desc_lower, breakdown_clean)
 
-            if prefilter_keep or extracted_email or any(k in desc_lower for k in ["workspace subscription", "upgrade plan to yearly subscription", "number purchased", "agent added", "number renew"]) or any(n in breakdown_clean for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS):
-                fetch_diag_rows.append(
-                    {
-                        "DiagnosticSection": "fetch_prefilter",
-                        "event": obj.get("event"),
-                        "distinct_id": props.get("distinct_id"),
-                        "time": props.get("time"),
-                        "$insert_id": props.get("$insert_id"),
-                        "$email": props.get("$email"),
-                        "Amount": props.get("Amount"),
-                        "Amount Description": amount_desc,
-                        "Amount Breakdown": amount_breakdown,
-                        "Amount Breakdown by Unit": amount_breakdown_by_unit,
-                        "desc_lower": desc_lower,
-                        "desc_has_email": bool(extracted_email),
-                        "extracted_email": extracted_email,
-                        "breakdown_clean": breakdown_clean,
-                        "breakdown_has_annual_num": any(n in breakdown_clean for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS),
-                        "kept_after_prefilter": bool(prefilter_keep),
-                    }
-                )
-
-            if not prefilter_keep:
+            if not _row_is_candidate(desc_lower, breakdown_clean):
                 continue
 
             stats["rows_kept_prefilter"] += 1
@@ -544,9 +516,7 @@ def fetch_mixpanel_npm(to_date):
     rows = [v[1] for v in kept.values()]
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
     stats["rows_dedup_final"] = len(df)
-
-    fetch_diag_df = pd.DataFrame(fetch_diag_rows) if fetch_diag_rows else pd.DataFrame()
-    return df, stats, fetch_diag_df
+    return df, stats
 
 
 # -------------------------
@@ -555,8 +525,8 @@ def fetch_mixpanel_npm(to_date):
 def _build_summary_metrics(df, group_cols):
     if df.empty:
         cols = list(group_cols) + [
-            "Accounts", "Churned", "Annual Active",
-            "Upsell Net Change Sum", "Upsell Positive Only Sum", "Churn %"
+            "Accounts", "Connected", "Churn",
+            "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
         ]
         return pd.DataFrame(columns=cols)
 
@@ -564,194 +534,58 @@ def _build_summary_metrics(df, group_cols):
         df.groupby(group_cols, dropna=False, observed=False)
         .agg(
             Accounts=("EmailKey", "size"),
-            Churned=("Churned (AsOf MonthEnd)", lambda s: int(s.fillna(True).sum())),
+            Connected=("Connected", lambda s: int(pd.Series(s).fillna(False).sum())),
+            Churn=("Churned (AsOf MonthEnd)", lambda s: int(pd.Series(s).fillna(True).sum())),
             **{
-                "Annual Active": ("Annual Active (AsOf MonthEnd)", lambda s: int(s.fillna(False).sum())),
-                "Upsell Net Change Sum": ("Upsell Net Change", lambda s: float(s.fillna(0).sum())),
-                "Upsell Positive Only Sum": ("Upsell Positive Only", lambda s: float(s.fillna(0).sum())),
+                "Upsell (Net)": ("Upsell Net Change", lambda s: float(pd.Series(s).fillna(0).sum())),
+                "Upsell (Positive Only)": ("Upsell Positive Only", lambda s: float(pd.Series(s).fillna(0).sum())),
             }
         )
         .reset_index()
     )
-    out["Churn %"] = np.where(out["Accounts"] > 0, out["Churned"] / out["Accounts"], np.nan)
+    out["Churn %"] = np.where(out["Accounts"] > 0, out["Churn"] / out["Accounts"], np.nan)
     return out
 
 
-def summarize_basic(deals_enriched, connected_only):
-    df = deals_enriched.copy()
-    if connected_only:
-        df = df[df["Connected"] == True].copy()
-
-    df = df[df["DealMonth"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    overall = _build_summary_metrics(df, ["DealMonth"])
-    overall["Scope"] = "Overall"
-    overall["Deal Owner"] = "All"
-
-    if "Deal - Owner" in df.columns:
-        by_owner = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"])
-        by_owner = by_owner.rename(columns={"Deal - Owner": "Deal Owner"})
-        by_owner["Scope"] = "By Owner"
-    else:
-        by_owner = pd.DataFrame()
-
-    out = pd.concat([overall, by_owner], ignore_index=True)
-    out = out.sort_values(["DealMonth", "Scope", "Deal Owner"], kind="mergesort")
-    return out
-
-
-def summarize_owner_connected_status(deals_enriched):
+def summarize_overall(deals_enriched):
     df = deals_enriched.copy()
     df = df[df["DealMonth"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame()
+    return _build_summary_metrics(df, ["DealMonth"]).sort_values(["DealMonth"], kind="mergesort")
 
+
+def summarize_tier(deals_enriched):
+    df = deals_enriched.copy()
+    df = df[df["DealMonth"].notna()].copy()
+    if "Tier" not in df.columns:
+        df["Tier"] = pd.NA
+    out = _build_summary_metrics(df, ["DealMonth", "Tier"])
+    return out.sort_values(["DealMonth", "Tier"], kind="mergesort")
+
+
+def summarize_owner(deals_enriched):
+    df = deals_enriched.copy()
+    df = df[df["DealMonth"].notna()].copy()
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
-    if "Deal - Status" not in df.columns:
-        df["Deal - Status"] = pd.NA
-
-    group_cols = ["DealMonth", "Deal - Owner", "Connected", "Deal - Status"]
-    out = _build_summary_metrics(df, group_cols)
-    out = out.rename(columns={"Deal - Owner": "Deal Owner", "Deal - Status": "Deal Status"})
-    out = out.sort_values(["DealMonth", "Deal Owner", "Connected", "Deal Status"], kind="mergesort")
-    return out
+    out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"])
+    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
 
 
-# -------------------------
-# Diagnostics export
-# -------------------------
-def build_diagnostics_sheet(fetch_stats, fetch_diag_df, annual_diag_df, deals_enriched):
-    frames = []
-
-    if fetch_stats:
-        stats_df = pd.DataFrame(
-            [{"DiagnosticSection": "fetch_stats", "metric": k, "value": v} for k, v in fetch_stats.items()]
-        )
-        frames.append(stats_df)
-
-    annual_focus = pd.DataFrame()
-    annual_focus_emails = set()
-
-    if annual_diag_df is not None and not annual_diag_df.empty:
-        annual_focus = annual_diag_df[
-            annual_diag_df["annual_candidate"].fillna(False)
-            | annual_diag_df["breakdown_mask"].fillna(False)
-            | annual_diag_df["annual_renew_action_with_breakdown"].fillna(False)
-        ].copy()
-        if not annual_focus.empty:
-            annual_focus = annual_focus.sort_values(["EmailKey", "PayDT"], kind="mergesort")
-            annual_focus = annual_focus.groupby("EmailKey", dropna=False, observed=False).tail(3).copy()
-            annual_focus_emails = set(annual_focus["EmailKey"].dropna().astype(str).tolist())
-            frames.append(annual_focus)
-
-    if fetch_diag_df is not None and not fetch_diag_df.empty:
-        fetch_focus = fetch_diag_df.copy()
-        if annual_focus_emails:
-            fetch_focus = fetch_focus[
-                fetch_focus.get("extracted_email", pd.Series(index=fetch_focus.index, dtype=object)).astype(str).isin(annual_focus_emails)
-                | fetch_focus.get("$email", pd.Series(index=fetch_focus.index, dtype=object)).astype(str).isin(annual_focus_emails)
-                | fetch_focus.get("kept_after_prefilter", pd.Series(index=fetch_focus.index, dtype=bool)).fillna(False)
-            ].copy()
-        if not fetch_focus.empty:
-            fetch_focus = fetch_focus.groupby(
-                [
-                    fetch_focus.get("extracted_email", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
-                    fetch_focus.get("$email", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
-                    fetch_focus.get("Amount Description", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
-                ],
-                dropna=False,
-                observed=False,
-            ).tail(2).copy()
-            frames.append(fetch_focus)
-
-    if deals_enriched is not None and not deals_enriched.empty:
-        mapping_cols = [
-            "DealMonth",
-            "Person - Email",
-            "EmailKey",
-            "Deal - Title" if "Deal - Title" in deals_enriched.columns else None,
-            "Deal - Owner" if "Deal - Owner" in deals_enriched.columns else None,
-            "Connected",
-            "Tier",
-            "Current Month Renew Amount",
-            "Previous Month Renew Amount",
-            "Current Month Renew Date",
-            "Previous Month Renew Date",
-            "Latest Monthly PayDT (AsOf MonthEnd)",
-            "Latest Annual PayDT (AsOf MonthEnd)",
-            "Annual Payment Type (AsOf MonthEnd)",
-            "Monthly Valid Till (AsOf MonthEnd)",
-            "Annual Valid Till (AsOf MonthEnd)",
-            "Subscription Valid Till (AsOf MonthEnd)",
-            "Annual Active (AsOf MonthEnd)",
-            "Active Subscription (AsOf MonthEnd)",
-            "Churned (AsOf MonthEnd)",
-            "Upsell Net Change",
-            "Upsell Positive Only",
-        ]
-        mapping_cols = [c for c in mapping_cols if c is not None and c in deals_enriched.columns]
-        deal_map = deals_enriched[mapping_cols].copy()
-        keep_map = deal_map["Latest Annual PayDT (AsOf MonthEnd)"].notna() | deal_map["Annual Active (AsOf MonthEnd)"].fillna(False)
-        if annual_focus_emails:
-            keep_map = keep_map | deal_map["EmailKey"].astype(str).isin(annual_focus_emails)
-        deal_map = deal_map[keep_map].copy()
-        if not deal_map.empty:
-            deal_map.insert(0, "DiagnosticSection", "deal_mapping")
-            frames.append(deal_map)
-
-    if not frames:
-        return pd.DataFrame()
-
-    diagnostics = pd.concat(frames, ignore_index=True, sort=False)
-    preferred_cols = [
-        "DiagnosticSection",
-        "metric",
-        "value",
-        "EmailKey",
-        "Person - Email",
-        "$email",
-        "Amount",
-        "AmountNum",
-        "Amount Description",
-        "Amount Breakdown",
-        "Amount Breakdown by Unit",
-        "PayDT",
-        "DealMonth",
-        "Current Month Renew Amount",
-        "Previous Month Renew Amount",
-        "Current Month Renew Date",
-        "Previous Month Renew Date",
-        "Latest Monthly PayDT (AsOf MonthEnd)",
-        "Latest Annual PayDT (AsOf MonthEnd)",
-        "Annual Payment Type (AsOf MonthEnd)",
-        "Annual Active (AsOf MonthEnd)",
-        "Active Subscription (AsOf MonthEnd)",
-        "Churned (AsOf MonthEnd)",
-        "contains_email",
-        "desc_has_comma",
-        "desc_no_comma",
-        "breakdown_mask",
-        "annual_start",
-        "annual_renew_original",
-        "annual_renew_action_with_breakdown",
-        "annual_renew_final",
-        "annual_candidate",
-        "annual_payment_type_detected",
-        "kept_after_prefilter",
-    ]
-    existing_first = [c for c in preferred_cols if c in diagnostics.columns]
-    other_cols = [c for c in diagnostics.columns if c not in existing_first]
-    diagnostics = diagnostics[existing_first + other_cols]
-    return diagnostics
+def summarize_tier_owner(deals_enriched):
+    df = deals_enriched.copy()
+    df = df[df["DealMonth"].notna()].copy()
+    if "Tier" not in df.columns:
+        df["Tier"] = pd.NA
+    if "Deal - Owner" not in df.columns:
+        df["Deal - Owner"] = "Unknown"
+    out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"])
+    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
 # -------------------------
 # Core enrichment
 # -------------------------
-def build_enriched_deals(deals_df, npm_df, fetch_diag_df=None, fetch_stats=None):
+def build_enriched_deals(deals_df, npm_df):
     deal_date_col = "Deal - Deal created on"
     deal_email_col = "Person - Email"
     deal_owner_col = "Deal - Owner"
@@ -802,11 +636,11 @@ def build_enriched_deals(deals_df, npm_df, fetch_diag_df=None, fetch_stats=None)
 
     if npm_df is None or npm_df.empty:
         out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
-        summary_all = summarize_basic(out, False)
-        summary_connected = summarize_basic(out, True)
-        summary_owner_cs = summarize_owner_connected_status(out)
-        diagnostics_df = build_diagnostics_sheet(fetch_stats, fetch_diag_df, pd.DataFrame(), out)
-        return out, summary_all, summary_connected, summary_owner_cs, diagnostics_df
+        summary_overall = summarize_overall(out)
+        summary_tier = summarize_tier(out)
+        summary_owner = summarize_owner(out)
+        summary_tier_owner = summarize_tier_owner(out)
+        return out, summary_overall, summary_tier, summary_owner, summary_tier_owner
 
     npm = npm_df.copy()
     npm = npm.loc[:, ~npm.columns.duplicated()].copy()
@@ -1029,72 +863,30 @@ def build_enriched_deals(deals_df, npm_df, fetch_diag_df=None, fetch_stats=None)
 
     deals_dedup["Upsell Net Change"] = np.where(eligible, (curr_amt - prev_amt), 0.0)
     deals_dedup["Upsell Positive Only"] = np.where(deals_dedup["Upsell Net Change"] > 0, deals_dedup["Upsell Net Change"], 0.0)
-
-    annual_diag_df = npm_valid[[
-        "EmailKey",
-        "$email",
-        "Amount",
-        "Amount Description",
-        "Amount Breakdown",
-        "Amount Breakdown by Unit",
-        "PayDT",
-        "PayMonth",
-    ]].copy()
-    annual_diag_df.insert(0, "DiagnosticSection", "annual_logic")
-    annual_diag_df["AmountNum"] = npm_valid["AmountNum"]
-    annual_diag_df["contains_email"] = contains_email
-    annual_diag_df["desc_has_comma"] = desc_has_comma
-    annual_diag_df["desc_no_comma"] = desc_no_comma
-    annual_diag_df["breakdown_mask"] = breakdown_mask
-    annual_diag_df["annual_start"] = annual_start
-    annual_diag_df["annual_renew_original"] = annual_renew_original
-    annual_diag_df["annual_renew_action_with_breakdown"] = annual_renew_action_with_breakdown
-    annual_diag_df["annual_renew_final"] = annual_renew
-    annual_diag_df["annual_candidate"] = annual_start | annual_renew
-    annual_diag_df["annual_payment_type_detected"] = np.where(
-        annual_start | annual_renew,
-        np.where(annual_start, "Subscription", "Renew"),
-        pd.NA,
-    )
-
-    deal_emails = set(deals_dedup["EmailKey"].dropna().astype(str).tolist())
-    if deal_emails:
-        annual_diag_df = annual_diag_df[
-            annual_diag_df["EmailKey"].astype(str).isin(deal_emails)
-            | annual_diag_df["annual_candidate"].fillna(False)
-        ].copy()
-
-        if fetch_diag_df is not None and not fetch_diag_df.empty:
-            fetch_diag_df = fetch_diag_df[
-                fetch_diag_df.get("extracted_email", pd.Series(index=fetch_diag_df.index, dtype=object)).astype(str).isin(deal_emails)
-                | fetch_diag_df.get("$email", pd.Series(index=fetch_diag_df.index, dtype=object)).astype(str).isin(deal_emails)
-                | fetch_diag_df.get("kept_after_prefilter", pd.Series(index=fetch_diag_df.index, dtype=bool)).fillna(False)
-            ].copy()
-
     out = deals_dedup.drop(columns=["_dedup_key", "Current Month Renew DT Fallback"], errors="ignore").copy()
-    summary_all = summarize_basic(out, False)
-    summary_connected = summarize_basic(out, True)
-    summary_owner_cs = summarize_owner_connected_status(out)
-    diagnostics_df = build_diagnostics_sheet(fetch_stats, fetch_diag_df, annual_diag_df, out)
-    return out, summary_all, summary_connected, summary_owner_cs, diagnostics_df
+    summary_overall = summarize_overall(out)
+    summary_tier = summarize_tier(out)
+    summary_owner = summarize_owner(out)
+    summary_tier_owner = summarize_tier_owner(out)
+    return out, summary_overall, summary_tier, summary_owner, summary_tier_owner
 
 
 @st.cache_data(show_spinner=False)
 def make_excel(
     deals_raw,
     deals_enriched,
-    summary_all,
-    summary_connected,
-    summary_owner_cs,
-    diagnostics_df,
+    summary_overall,
+    summary_tier,
+    summary_owner,
+    summary_tier_owner,
 ):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         deals_enriched.to_excel(writer, sheet_name="Deals_enriched", index=False)
-        summary_all.to_excel(writer, sheet_name="Summary_all", index=False)
-        summary_connected.to_excel(writer, sheet_name="Summary_connected", index=False)
-        summary_owner_cs.to_excel(writer, sheet_name="Summary_owner_connected_status", index=False)
-        diagnostics_df.to_excel(writer, sheet_name="Diagnostics", index=False)
+        summary_overall.to_excel(writer, sheet_name="Summary_overall", index=False)
+        summary_tier.to_excel(writer, sheet_name="Summary_tier", index=False)
+        summary_owner.to_excel(writer, sheet_name="Summary_owner", index=False)
+        summary_tier_owner.to_excel(writer, sheet_name="Summary_tier_owner", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
     return output.getvalue()
 
@@ -1104,20 +896,15 @@ def kpi_row(summary_df):
         st.info("No summary available.")
         return
 
-    overall = summary_df[summary_df["Scope"] == "Overall"].copy()
-    if overall.empty:
-        st.info("No overall summary available.")
-        return
-
-    latest = overall.sort_values("DealMonth").iloc[-1]
+    latest = summary_df.sort_values("DealMonth").iloc[-1]
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Accounts", int(latest["Accounts"]))
-    c2.metric("Churned", int(latest["Churned"]))
+    c2.metric("Connected", int(latest["Connected"]))
+    c3.metric("Churn", int(latest["Churn"]))
     churn_pct = float(latest["Churn %"]) * 100 if pd.notna(latest["Churn %"]) else np.nan
-    c3.metric("Churn %", f"{churn_pct:.2f}%" if pd.notna(churn_pct) else "NA")
-    c4.metric("Annual Active", int(latest["Annual Active"]))
-    c5.metric("Upsell Net Sum", f'{float(latest["Upsell Net Change Sum"]):,.2f}')
-    c6.metric("Upsell Positive Only", f'{float(latest["Upsell Positive Only Sum"]):,.2f}')
+    c4.metric("Churn %", f"{churn_pct:.2f}%" if pd.notna(churn_pct) else "NA")
+    c5.metric("Upsell Net", f'{float(latest["Upsell (Net)"]):,.2f}')
+    c6.metric("Upsell Positive Only", f'{float(latest["Upsell (Positive Only)"]):,.2f}')
 
 
 def main():
@@ -1141,7 +928,6 @@ def main():
     st.sidebar.caption("Mixpanel Export API. A minimum annual-history lookback is applied automatically.")
     deals_file = st.sidebar.file_uploader("Upload Deals CSV", type=["csv"])
     fetch_btn = st.sidebar.button("Fetch payments", type="primary")
-    focus_connected = st.sidebar.toggle("Connected only view", value=False)
 
     if deals_file is None:
         st.info("Upload your Deals CSV to begin.")
@@ -1156,17 +942,15 @@ def main():
 
     if fetch_btn or needs_fetch:
         with st.spinner("Fetching Mixpanel payments..."):
-            npm_df, stats, fetch_diag_df = fetch_mixpanel_npm(end_date)
+            npm_df, stats = fetch_mixpanel_npm(end_date)
             st.session_state["npm_cached"] = npm_df
             st.session_state["npm_stats"] = stats
-            st.session_state["npm_fetch_diag"] = fetch_diag_df
             st.session_state["last_fetch_to_date"] = end_date
             if fetch_btn:
                 st.success("Payments fetched.")
 
     npm_df = st.session_state.get("npm_cached")
     fetch_stats = st.session_state.get("npm_stats")
-    fetch_diag_df = st.session_state.get("npm_fetch_diag")
 
     if npm_df is None:
         st.warning("Click Fetch payments to load Mixpanel events.")
@@ -1177,27 +961,29 @@ def main():
         st.sidebar.write(fetch_stats)
 
     with st.spinner("Building enriched dataset..."):
-        deals_enriched, summary_all, summary_connected, summary_owner_cs, diagnostics_df = build_enriched_deals(
-            deals_raw, npm_df, fetch_diag_df=fetch_diag_df, fetch_stats=fetch_stats
+        deals_enriched, summary_overall, summary_tier, summary_owner, summary_tier_owner = build_enriched_deals(
+            deals_raw, npm_df
         )
 
-    summary_view = summary_connected if focus_connected else summary_all
-    kpi_row(summary_view)
+    kpi_row(summary_overall)
 
     tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Visuals", "Deals enriched", "Payments preview"])
 
     with tab1:
-        st.subheader("All deals")
-        st.dataframe(summary_all, use_container_width=True)
+        st.subheader("Overall summary")
+        st.dataframe(summary_overall, use_container_width=True)
 
-        st.subheader("Connected only")
-        st.dataframe(summary_connected, use_container_width=True)
+        st.subheader("Tier wise summary")
+        st.dataframe(summary_tier, use_container_width=True)
 
-        st.subheader("Owner + Connected + Deal Status breakdown")
-        st.dataframe(summary_owner_cs, use_container_width=True)
+        st.subheader("Owner wise summary")
+        st.dataframe(summary_owner, use_container_width=True)
+
+        st.subheader("Tier and Owner wise summary")
+        st.dataframe(summary_tier_owner, use_container_width=True)
 
     with tab2:
-        overall = summary_view[summary_view["Scope"] == "Overall"].copy() if not summary_view.empty else pd.DataFrame()
+        overall = summary_overall.copy()
         if overall.empty:
             st.info("No data to chart.")
         else:
@@ -1205,12 +991,12 @@ def main():
             overall = overall.sort_values("DealMonth")
             st.caption("Churn percentage over time")
             st.line_chart(overall.set_index("DealMonth")[["Churn %"]])
-            st.caption("Churned accounts over time")
-            st.line_chart(overall.set_index("DealMonth")[["Churned"]])
-            st.caption("Upsell net change sum over time")
-            st.line_chart(overall.set_index("DealMonth")[["Upsell Net Change Sum"]])
-            st.caption("Upsell positive only sum over time")
-            st.line_chart(overall.set_index("DealMonth")[["Upsell Positive Only Sum"]])
+            st.caption("Churn count over time")
+            st.line_chart(overall.set_index("DealMonth")[["Churn"]])
+            st.caption("Upsell net over time")
+            st.line_chart(overall.set_index("DealMonth")[["Upsell (Net)"]])
+            st.caption("Upsell positive only over time")
+            st.line_chart(overall.set_index("DealMonth")[["Upsell (Positive Only)"]])
 
     with tab3:
         st.dataframe(deals_enriched, use_container_width=True)
@@ -1221,28 +1007,24 @@ def main():
 
     st.divider()
     st.subheader("Export")
-    prepare_export = st.button("Prepare Excel workbook", key="prepare_excel_export")
-    if prepare_export:
-        with st.spinner("Preparing Excel workbook..."):
-            st.session_state["excel_export_bytes"] = make_excel(
-                deals_raw=deals_raw,
-                deals_enriched=deals_enriched,
-                summary_all=summary_all,
-                summary_connected=summary_connected,
-                summary_owner_cs=summary_owner_cs,
-                diagnostics_df=diagnostics_df,
-            )
-            st.session_state["excel_export_ready"] = True
-        st.success("Excel workbook prepared.")
+    st.caption("The workbook below is generated from the current dataset and summaries.")
 
-    if st.session_state.get("excel_export_ready") and st.session_state.get("excel_export_bytes") is not None:
-        st.download_button(
-            "Download Excel workbook",
-            data=st.session_state["excel_export_bytes"],
-            file_name="account_mgmt_upsell_churn_enriched.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_excel_workbook",
-        )
+    excel_bytes = make_excel(
+        deals_raw=deals_raw,
+        deals_enriched=deals_enriched,
+        summary_overall=summary_overall,
+        summary_tier=summary_tier,
+        summary_owner=summary_owner,
+        summary_tier_owner=summary_tier_owner,
+    )
+
+    st.download_button(
+        "Download Excel workbook",
+        data=excel_bytes,
+        file_name="account_mgmt_upsell_churn_enriched.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_excel_workbook",
+    )
 
 
 if __name__ == "__main__":
