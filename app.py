@@ -1128,10 +1128,14 @@ def main():
         summary_tier_owner=summary_tier_owner,
     )
 
+    report_month_for_name = pd.Timestamp(_month_start_from_date(report_current_month_input)).strftime("%b_%Y")
+    generated_date_for_name = date.today().isoformat()
+    download_filename = f"AMKPI_{report_month_for_name}_{generated_date_for_name}.xlsx"
+
     st.download_button(
         "Download Excel workbook",
         data=excel_bytes,
-        file_name="account_mgmt_upsell_churn_enriched.xlsx",
+        file_name=download_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_excel_workbook",
     )
