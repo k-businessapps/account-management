@@ -329,6 +329,44 @@ def _safe_parse_date(v):
         return None
 
 
+def _month_start_from_date(v):
+    if v is None:
+        return pd.NaT
+    return pd.Timestamp(v).to_period("M").to_timestamp()
+
+
+def _prev_month_start(month_start):
+    if pd.isna(month_start):
+        return pd.NaT
+    return (pd.Timestamp(month_start) - pd.offsets.MonthBegin(1)).to_period("M").to_timestamp()
+
+
+def _aligned_prev_month_cutoff(report_month_start, churn_cutoff_date):
+    if churn_cutoff_date is None or pd.isna(report_month_start):
+        return None
+    report_month_start = pd.Timestamp(report_month_start)
+    prev_month_start = _prev_month_start(report_month_start)
+    prev_month_end = prev_month_start + pd.offsets.MonthEnd(0)
+    try:
+        day = int(pd.Timestamp(churn_cutoff_date).day)
+    except Exception:
+        return None
+    day = max(1, day)
+    max_day = int(prev_month_end.day)
+    aligned_day = min(day, max_day)
+    return (prev_month_start + pd.Timedelta(days=aligned_day - 1)).date()
+
+
+def _month_end_date(month_start):
+    if pd.isna(month_start):
+        return None
+    return (pd.Timestamp(month_start) + pd.offsets.MonthEnd(0)).date()
+
+
+def _to_date_safe(series):
+    return pd.to_datetime(series, errors="coerce").dt.date
+
+
 def _series_contains_email(email_series, desc_series_lower):
     out = []
     for e, d in zip(email_series, desc_series_lower):
@@ -525,7 +563,7 @@ def fetch_mixpanel_npm(to_date):
 def _build_summary_metrics(df, group_cols):
     if df.empty:
         cols = list(group_cols) + [
-            "Accounts", "Connected", "Churn",
+            "Accounts", "Connected", "Churn Eligible Accounts", "Churn",
             "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
         ]
         return pd.DataFrame(columns=cols)
@@ -535,15 +573,20 @@ def _build_summary_metrics(df, group_cols):
         .agg(
             Accounts=("EmailKey", "size"),
             Connected=("Connected", lambda s: int(pd.Series(s).fillna(False).sum())),
-            Churn=("Churned (AsOf MonthEnd)", lambda s: int(pd.Series(s).fillna(True).sum())),
             **{
+                "Churn Eligible Accounts": ("Churn Eligible", lambda s: int(pd.Series(s).fillna(False).sum())),
+                "Churn": ("Churned (Reporting)", lambda s: int(pd.Series(s).fillna(False).sum())),
                 "Upsell (Net)": ("Upsell Net Change", lambda s: float(pd.Series(s).fillna(0).sum())),
                 "Upsell (Positive Only)": ("Upsell Positive Only", lambda s: float(pd.Series(s).fillna(0).sum())),
             }
         )
         .reset_index()
     )
-    out["Churn %"] = np.where(out["Accounts"] > 0, out["Churn"] / out["Accounts"], np.nan)
+    out["Churn %"] = np.where(
+        out["Churn Eligible Accounts"] > 0,
+        out["Churn"] / out["Churn Eligible Accounts"],
+        np.nan,
+    )
     return out
 
 
@@ -585,7 +628,7 @@ def summarize_tier_owner(deals_enriched):
 # -------------------------
 # Core enrichment
 # -------------------------
-def build_enriched_deals(deals_df, npm_df):
+def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_date=None):
     deal_date_col = "Deal - Deal created on"
     deal_email_col = "Person - Email"
     deal_owner_col = "Deal - Owner"
@@ -598,12 +641,19 @@ def build_enriched_deals(deals_df, npm_df):
     if missing:
         raise KeyError(f"Deals file missing columns: {missing}")
 
+    report_month_start = _month_start_from_date(report_current_month)
+    prev_report_month_start = _prev_month_start(report_month_start)
+    churn_prev_month_cutoff_date = _aligned_prev_month_cutoff(report_month_start, churn_cutoff_date)
+    report_month_end_date = _month_end_date(report_month_start)
+
     deals = deals_df.copy()
     deals["_deal_created_dt"] = pd.to_datetime(deals[deal_date_col], errors="coerce", utc=True).dt.tz_convert(None)
     if deals["_deal_created_dt"].isna().all():
         deals["_deal_created_dt"] = pd.to_datetime(deals[deal_date_col], errors="coerce")
 
-    deals["DealMonth"] = deals["_deal_created_dt"].dt.to_period("M").dt.to_timestamp()
+    deals["Original Deal Month"] = deals["_deal_created_dt"].dt.to_period("M").dt.to_timestamp()
+    deals["DealMonth"] = pd.Timestamp(report_month_start)
+    deals["PrevDealMonth"] = pd.Timestamp(prev_report_month_start)
     deals["EmailKey"] = deals[deal_email_col].map(_normalize_email)
     deals["Tier"] = deals[deal_label_col].map(_tier_from_label)
 
@@ -632,10 +682,15 @@ def build_enriched_deals(deals_df, npm_df):
         kind="mergesort",
     )
     deals_dedup = deals_sorted.drop_duplicates(subset=["_dedup_key"], keep="first").copy()
-    deals_dedup["PrevDealMonth"] = (deals_dedup["DealMonth"] - pd.offsets.MonthBegin(1)).dt.to_period("M").dt.to_timestamp()
 
     if npm_df is None or npm_df.empty:
         out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
+        out["Report Current Month"] = pd.Timestamp(report_month_start).date()
+        out["Report Previous Month"] = pd.Timestamp(prev_report_month_start).date()
+        out["Churn Current Month Cutoff"] = churn_cutoff_date if churn_cutoff_date else pd.NaT
+        out["Churn Previous Month Cutoff"] = churn_prev_month_cutoff_date if churn_prev_month_cutoff_date else pd.NaT
+        out["Churn Eligible"] = True
+        out["Churned (Reporting)"] = out.get("Churned (AsOf MonthEnd)", False)
         summary_overall = summarize_overall(out)
         summary_tier = summarize_tier(out)
         summary_owner = summarize_owner(out)
@@ -855,6 +910,37 @@ def build_enriched_deals(deals_df, npm_df):
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
+    deals_dedup["Report Current Month"] = pd.Timestamp(report_month_start).date()
+    deals_dedup["Report Previous Month"] = pd.Timestamp(prev_report_month_start).date()
+    deals_dedup["Churn Current Month Cutoff"] = churn_cutoff_date if churn_cutoff_date else pd.NaT
+    deals_dedup["Churn Previous Month Cutoff"] = churn_prev_month_cutoff_date if churn_prev_month_cutoff_date else pd.NaT
+
+    if churn_prev_month_cutoff_date is None:
+        deals_dedup["Monthly Churn Eligible"] = True
+        deals_dedup["Annual Churn Eligible"] = True
+        deals_dedup["Churn Eligible"] = True
+    else:
+        prev_renew_date_series = pd.to_datetime(deals_dedup["Previous Month Renew Date"], errors="coerce").dt.date
+        deals_dedup["Monthly Churn Eligible"] = prev_renew_date_series.notna() & (prev_renew_date_series <= churn_prev_month_cutoff_date)
+
+        annual_due_date_series = pd.to_datetime(deals_dedup["Annual Valid Till (AsOf MonthEnd)"], errors="coerce").dt.date
+        annual_user_series = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].notna()
+        annual_due_after_cutoff_in_report_month = (
+            annual_user_series
+            & pd.Series(annual_due_date_series, index=deals_dedup.index).notna()
+            & (pd.Series(annual_due_date_series, index=deals_dedup.index) > churn_cutoff_date)
+            & (pd.Series(annual_due_date_series, index=deals_dedup.index) <= report_month_end_date)
+        )
+        deals_dedup["Annual Churn Eligible"] = annual_user_series & (~annual_due_after_cutoff_in_report_month)
+
+        deals_dedup["Churn Eligible"] = np.where(
+            annual_user_series,
+            deals_dedup["Annual Churn Eligible"],
+            deals_dedup["Monthly Churn Eligible"],
+        )
+
+    deals_dedup["Churned (Reporting)"] = deals_dedup["Churned (AsOf MonthEnd)"] & deals_dedup["Churn Eligible"].fillna(False)
+
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
@@ -924,6 +1010,20 @@ def main():
     if not login_gate():
         return
 
+    report_current_month_input = st.sidebar.date_input(
+        "Current month",
+        value=date.today().replace(day=1),
+        help="This report month is applied to all uploaded users. The previous month is derived automatically.",
+    )
+    use_mid_month_churn = st.sidebar.toggle("Use mid-month churn cutoff", value=False)
+    churn_cutoff_date = None
+    if use_mid_month_churn:
+        default_cutoff = _month_end_date(_month_start_from_date(report_current_month_input)) or date.today()
+        churn_cutoff_date = st.sidebar.date_input(
+            "Current month churn cutoff date",
+            value=default_cutoff,
+            help="Monthly churn will only consider users whose previous-month renewal date is on or before the aligned prior-month cutoff. Annual users whose annual due date falls after this cutoff within the current month are excluded from churn.",
+        )
     end_date = st.sidebar.date_input("Payments to date", value=date.today())
     st.sidebar.caption("Mixpanel Export API. A minimum annual-history lookback is applied automatically.")
     deals_file = st.sidebar.file_uploader("Upload Deals CSV", type=["csv"])
@@ -962,10 +1062,20 @@ def main():
 
     with st.spinner("Building enriched dataset..."):
         deals_enriched, summary_overall, summary_tier, summary_owner, summary_tier_owner = build_enriched_deals(
-            deals_raw, npm_df
+            deals_raw,
+            npm_df,
+            report_current_month=report_current_month_input,
+            churn_cutoff_date=churn_cutoff_date,
         )
 
     kpi_row(summary_overall)
+
+    prev_month_display = _prev_month_start(_month_start_from_date(report_current_month_input))
+    st.caption(
+        f"Reporting current month: {pd.Timestamp(_month_start_from_date(report_current_month_input)).date()} | "
+        f"Previous month: {pd.Timestamp(prev_month_display).date()} | "
+        f"Churn cutoff: {churn_cutoff_date if churn_cutoff_date else 'Month end'}"
+    )
 
     tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Visuals", "Deals enriched", "Payments preview"])
 
