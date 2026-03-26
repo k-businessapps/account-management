@@ -560,12 +560,16 @@ def fetch_mixpanel_npm(to_date):
 # -------------------------
 # Summary tables
 # -------------------------
-def _build_summary_metrics(df, group_cols):
+def _build_summary_metrics(df, group_cols, include_connected_pct=True):
+    base_cols = [
+        "Accounts", "Connected", "Churn Eligible Accounts", "Churn",
+        "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
+    ]
+    if include_connected_pct:
+        base_cols.insert(2, "Connected %")
+
     if df.empty:
-        cols = list(group_cols) + [
-            "Accounts", "Connected", "Churn Eligible Accounts", "Churn",
-            "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
-        ]
+        cols = list(group_cols) + base_cols
         return pd.DataFrame(columns=cols)
 
     out = (
@@ -582,9 +586,15 @@ def _build_summary_metrics(df, group_cols):
         )
         .reset_index()
     )
+    if include_connected_pct:
+        out["Connected %"] = np.where(
+            out["Accounts"] > 0,
+            (out["Connected"] / out["Accounts"]) * 100,
+            np.nan,
+        )
     out["Churn %"] = np.where(
         out["Churn Eligible Accounts"] > 0,
-        out["Churn"] / out["Churn Eligible Accounts"],
+        (out["Churn"] / out["Churn Eligible Accounts"]) * 100,
         np.nan,
     )
     return out
@@ -593,7 +603,7 @@ def _build_summary_metrics(df, group_cols):
 def summarize_overall(deals_enriched):
     df = deals_enriched.copy()
     df = df[df["DealMonth"].notna()].copy()
-    return _build_summary_metrics(df, ["DealMonth"]).sort_values(["DealMonth"], kind="mergesort")
+    return _build_summary_metrics(df, ["DealMonth"], include_connected_pct=True).sort_values(["DealMonth"], kind="mergesort")
 
 
 def summarize_tier(deals_enriched):
@@ -601,7 +611,7 @@ def summarize_tier(deals_enriched):
     df = df[df["DealMonth"].notna()].copy()
     if "Tier" not in df.columns:
         df["Tier"] = pd.NA
-    out = _build_summary_metrics(df, ["DealMonth", "Tier"])
+    out = _build_summary_metrics(df, ["DealMonth", "Tier"], include_connected_pct=True)
     return out.sort_values(["DealMonth", "Tier"], kind="mergesort")
 
 
@@ -610,7 +620,7 @@ def summarize_owner(deals_enriched):
     df = df[df["DealMonth"].notna()].copy()
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
-    out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"])
+    out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=True)
     return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
 
 
@@ -621,7 +631,18 @@ def summarize_tier_owner(deals_enriched):
         df["Tier"] = pd.NA
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
-    out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"])
+    out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"], include_connected_pct=True)
+    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
+
+
+def summarize_tier_owner_connected(deals_enriched):
+    df = deals_enriched.copy()
+    df = df[(df["DealMonth"].notna()) & (df["Connected"] == True)].copy()
+    if "Tier" not in df.columns:
+        df["Tier"] = pd.NA
+    if "Deal - Owner" not in df.columns:
+        df["Deal - Owner"] = "Unknown"
+    out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"], include_connected_pct=False)
     return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
@@ -695,7 +716,8 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
         summary_tier = summarize_tier(out)
         summary_owner = summarize_owner(out)
         summary_tier_owner = summarize_tier_owner(out)
-        return out, summary_overall, summary_tier, summary_owner, summary_tier_owner
+        summary_tier_owner_connected = summarize_tier_owner_connected(out)
+        return out, summary_overall, summary_tier, summary_owner, summary_tier_owner, summary_tier_owner_connected
 
     npm = npm_df.copy()
     npm = npm.loc[:, ~npm.columns.duplicated()].copy()
@@ -954,7 +976,8 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     summary_tier = summarize_tier(out)
     summary_owner = summarize_owner(out)
     summary_tier_owner = summarize_tier_owner(out)
-    return out, summary_overall, summary_tier, summary_owner, summary_tier_owner
+    summary_tier_owner_connected = summarize_tier_owner_connected(out)
+    return out, summary_overall, summary_tier, summary_owner, summary_tier_owner, summary_tier_owner_connected
 
 
 @st.cache_data(show_spinner=False)
@@ -965,6 +988,7 @@ def make_excel(
     summary_tier,
     summary_owner,
     summary_tier_owner,
+    summary_tier_owner_connected,
 ):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -973,6 +997,7 @@ def make_excel(
         summary_tier.to_excel(writer, sheet_name="Summary_tier", index=False)
         summary_owner.to_excel(writer, sheet_name="Summary_owner", index=False)
         summary_tier_owner.to_excel(writer, sheet_name="Summary_tier_owner", index=False)
+        summary_tier_owner_connected.to_excel(writer, sheet_name="Summary_tier_owner_conn", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
     return output.getvalue()
 
@@ -987,7 +1012,7 @@ def kpi_row(summary_df):
     c1.metric("Accounts", int(latest["Accounts"]))
     c2.metric("Connected", int(latest["Connected"]))
     c3.metric("Churn", int(latest["Churn"]))
-    churn_pct = float(latest["Churn %"]) * 100 if pd.notna(latest["Churn %"]) else np.nan
+    churn_pct = float(latest["Churn %"]) if pd.notna(latest["Churn %"]) else np.nan
     c4.metric("Churn %", f"{churn_pct:.2f}%" if pd.notna(churn_pct) else "NA")
     c5.metric("Upsell Net", f'{float(latest["Upsell (Net)"]):,.2f}')
     c6.metric("Upsell Positive Only", f'{float(latest["Upsell (Positive Only)"]):,.2f}')
@@ -1061,7 +1086,7 @@ def main():
         st.sidebar.write(fetch_stats)
 
     with st.spinner("Building enriched dataset..."):
-        deals_enriched, summary_overall, summary_tier, summary_owner, summary_tier_owner = build_enriched_deals(
+        deals_enriched, summary_overall, summary_tier, summary_owner, summary_tier_owner, summary_tier_owner_connected = build_enriched_deals(
             deals_raw,
             npm_df,
             report_current_month=report_current_month_input,
@@ -1091,6 +1116,9 @@ def main():
 
         st.subheader("Tier and Owner wise summary")
         st.dataframe(summary_tier_owner, use_container_width=True)
+
+        st.subheader("Tier and Owner wise summary. Connected only")
+        st.dataframe(summary_tier_owner_connected, use_container_width=True)
 
     with tab2:
         overall = summary_overall.copy()
@@ -1126,6 +1154,7 @@ def main():
         summary_tier=summary_tier,
         summary_owner=summary_owner,
         summary_tier_owner=summary_tier_owner,
+        summary_tier_owner_connected=summary_tier_owner_connected,
     )
 
     report_month_for_name = pd.Timestamp(_month_start_from_date(report_current_month_input)).strftime("%b_%Y")
