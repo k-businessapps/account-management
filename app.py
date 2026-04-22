@@ -251,7 +251,10 @@ def _annual_desc_series_mask(series):
 
 def _excluded_credit_desc_series_mask(series):
     s = series.fillna("").astype(str).str.strip().str.lower()
-    return s.isin(EXCLUDED_UPSELL_DESCRIPTIONS)
+    mask = pd.Series(False, index=s.index)
+    for marker in EXCLUDED_UPSELL_DESCRIPTION_MARKERS:
+        mask = mask | s.str.contains(re.escape(marker), na=False)
+    return mask
 
 
 def _row_is_candidate(desc_lower, breakdown_clean=""):
