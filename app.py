@@ -33,7 +33,12 @@ ANNUAL_AMOUNT_THRESHOLD = 40.0
 ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
 ANNUAL_SUBSCRIPTION_TEXT_MARKERS = ["workspace subscription", "advance,", "starter,", "stater,"]
 EXCLUDED_UPSELL_DESCRIPTIONS = {"purchased credit", "credit purchased", "amount recharged"}
-
+EXCLUDED_UPSELL_DESCRIPTION_MARKERS = [
+    "purchased credit",
+    "credit purchased",
+    "amount recharged",
+    "number renew",
+]
 
 # -------------------------
 # State
