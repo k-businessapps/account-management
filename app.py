@@ -38,6 +38,7 @@ EXCLUDED_UPSELL_DESCRIPTION_MARKERS = [
     "credit purchased",
     "amount recharged",
     "number renew",
+    "renew",
 ]
 
 # -------------------------
