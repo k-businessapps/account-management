@@ -32,14 +32,21 @@ ALLOWED_ANNUAL_BREAKDOWN_NUMS = [
 ANNUAL_AMOUNT_THRESHOLD = 40.0
 ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
 ANNUAL_SUBSCRIPTION_TEXT_MARKERS = ["workspace subscription", "advance,", "starter,", "stater,"]
-EXCLUDED_UPSELL_DESCRIPTIONS = {"purchased credit", "credit purchased", "amount recharged"}
-EXCLUDED_UPSELL_DESCRIPTION_MARKERS = [
+ANNUAL_OR_YEARLY_RE = re.compile(r"\b(?:annual|yearly)\b", re.IGNORECASE)
+
+# Annual users can buy add-ons after moving to annual. For annual-user upsell, exclude
+# credit/recharge rows plus any renewal/subscription/non-VoIP rows.
+EXCLUDED_ANNUAL_USER_UPSELL_MARKERS = [
     "purchased credit",
     "credit purchased",
     "amount recharged",
     "number renew",
+    "non voip",
+    "non-voip",
+    "subscription",
     "renew",
 ]
+
 
 # -------------------------
 # State
@@ -255,10 +262,15 @@ def _annual_desc_series_mask(series):
     return mask
 
 
-def _excluded_credit_desc_series_mask(series):
+def _annual_or_yearly_desc_series_mask(series):
+    s = series.fillna("").astype(str)
+    return s.str.contains(ANNUAL_OR_YEARLY_RE, na=False)
+
+
+def _excluded_annual_user_upsell_desc_series_mask(series):
     s = series.fillna("").astype(str).str.strip().str.lower()
     mask = pd.Series(False, index=s.index)
-    for marker in EXCLUDED_UPSELL_DESCRIPTION_MARKERS:
+    for marker in EXCLUDED_ANNUAL_USER_UPSELL_MARKERS:
         mask = mask | s.str.contains(re.escape(marker), na=False)
     return mask
 
@@ -867,20 +879,23 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     cond_number_purchased_any = desc_lower.str.contains("number purchased", na=False)
     cond_number_renew_any = desc_lower.str.contains("number renew", na=False)
     cond_annual_subscription_text_any = _annual_desc_series_mask(npm_valid["Amount Description"])
+    cond_annual_or_yearly_any = _annual_or_yearly_desc_series_mask(npm_valid["Amount Description"])
 
-    annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
-        cond_annual_subscription_text_any | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
+    amount_over_annual_threshold = npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD
+    cond_annual_upgrade_exact = desc_lower == ANNUAL_UPGRADE_DESC_EXACT
+
+    # Tight annual-start qualification:
+    # 1. Exact yearly-upgrade event.
+    # 2. Plan markers such as Workspace Subscription, Starter, or Advance only when
+    #    the breakdown proves an annual amount.
+    # 3. Any clearly annual/yearly description.
+    annual_start = amount_over_annual_threshold & (
+        cond_annual_upgrade_exact
+        | (cond_annual_subscription_text_any & breakdown_mask)
+        | cond_annual_or_yearly_any
     )
 
-    annual_renew_original = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
-        (contains_email & desc_no_comma) | breakdown_mask
-    )
-
-    annual_renew_action_with_breakdown = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
-        breakdown_mask & (cond_agent_added_any | cond_number_purchased_any)
-    )
-
-    annual_renew = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
+    annual_renew = amount_over_annual_threshold & (
         (contains_email & desc_no_comma)
         | (
             breakdown_mask
@@ -890,6 +905,7 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
                 | cond_number_purchased_any
                 | cond_number_renew_any
                 | cond_annual_subscription_text_any
+                | cond_annual_or_yearly_any
             )
         )
     )
@@ -898,20 +914,30 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     annual_candidates["Annual Payment Type"] = np.where(
         annual_start.loc[annual_candidates.index], "Subscription", "Renew"
     )
-
-    excluded_credit_mask = _excluded_credit_desc_series_mask(npm_valid["Amount Description"])
-    annual_user_upsell_txns = npm_valid[(~annual_start) & (~annual_renew) & (~excluded_credit_mask)].copy()
-    annual_user_upsell_by_month = (
-        annual_user_upsell_txns
-        .dropna(subset=["EmailKey", "PayMonth"])
-        .groupby(["EmailKey", "PayMonth"], dropna=False, observed=False)["AmountNum"]
-        .sum()
-        .rename("Annual User Current Month Upsell Amount")
-        .reset_index()
+    annual_candidates["Annual Qualification Reason"] = np.select(
+        [
+            cond_annual_upgrade_exact.loc[annual_candidates.index],
+            (cond_annual_subscription_text_any & breakdown_mask).loc[annual_candidates.index],
+            cond_annual_or_yearly_any.loc[annual_candidates.index],
+            annual_renew.loc[annual_candidates.index],
+        ],
+        [
+            "Exact yearly upgrade description",
+            "Plan marker plus annual breakdown amount",
+            "Annual/yearly description",
+            "Annual renewal pattern",
+        ],
+        default="Annual candidate",
     )
-    annual_user_upsell_map = annual_user_upsell_by_month.set_index(["EmailKey", "PayMonth"])[
-        "Annual User Current Month Upsell Amount"
-    ]
+
+    excluded_annual_user_upsell_desc_mask = _excluded_annual_user_upsell_desc_series_mask(
+        npm_valid["Amount Description"]
+    )
+    annual_user_upsell_txns = npm_valid[
+        (~annual_start)
+        & (~annual_renew)
+        & (~excluded_annual_user_upsell_desc_mask)
+    ].copy()
 
     cond_email_in_desc = contains_email
     cond_number_purchased = cond_number_purchased_any
@@ -981,11 +1007,6 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    deals_dedup["Annual User Current Month Upsell Amount"] = [
-        float(annual_user_upsell_map.get((e, m), 0.0))
-        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
-    ]
-
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -1004,19 +1025,27 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     monthly_asof = monthly_asof.rename(columns={"Latest Monthly PayDT": "Latest Monthly PayDT (AsOf MonthEnd)"})
 
     annual_for_asof = annual_candidates[
-        ["EmailKey", "PayDT", "Annual Payment Type", "Amount Description", "AmountNum"]
+        [
+            "EmailKey",
+            "PayDT",
+            "Annual Payment Type",
+            "Annual Qualification Reason",
+            "Amount Description",
+            "AmountNum",
+        ]
     ].copy()
     annual_asof = _merge_latest_asof(
         deal_month_index,
         annual_for_asof,
         payment_dt_col="PayDT",
-        extra_cols=["Annual Payment Type", "Amount Description", "AmountNum"],
+        extra_cols=["Annual Payment Type", "Annual Qualification Reason", "Amount Description", "AmountNum"],
         prefix="Latest Annual "
     )
     annual_asof = annual_asof.rename(
         columns={
             "Latest Annual PayDT": "Latest Annual PayDT (AsOf MonthEnd)",
             "Latest Annual Annual Payment Type": "Annual Payment Type (AsOf MonthEnd)",
+            "Latest Annual Annual Qualification Reason": "Annual Qualification Reason (AsOf MonthEnd)",
             "Latest Annual Amount Description": "Latest Annual Amount Description (AsOf MonthEnd)",
             "Latest Annual AmountNum": "Latest Annual Amount (AsOf MonthEnd)",
         }
@@ -1032,6 +1061,38 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
         on=["EmailKey", "DealMonth"],
         how="left",
     )
+
+    annual_upsell_txns_by_email = {
+        email: group.sort_values("PayDT", kind="mergesort").copy()
+        for email, group in annual_user_upsell_txns.dropna(subset=["EmailKey", "PayMonth", "PayDT"]).groupby(
+            "EmailKey", sort=False, dropna=False
+        )
+    }
+
+    def _annual_user_current_month_upsell_amount(email, month, latest_annual_dt):
+        if email is None or pd.isna(month) or pd.isna(latest_annual_dt):
+            return 0.0
+        txns = annual_upsell_txns_by_email.get(email)
+        if txns is None or txns.empty:
+            return 0.0
+        month = pd.Timestamp(month)
+        latest_annual_dt = pd.Timestamp(latest_annual_dt)
+        matched = txns[
+            (txns["PayMonth"] == month)
+            & (txns["PayDT"] >= latest_annual_dt)
+        ]
+        if matched.empty:
+            return 0.0
+        return float(pd.to_numeric(matched["AmountNum"], errors="coerce").fillna(0.0).sum())
+
+    deals_dedup["Annual User Current Month Upsell Amount"] = [
+        _annual_user_current_month_upsell_amount(e, m, a)
+        for e, m, a in zip(
+            deals_dedup["EmailKey"],
+            deals_dedup["DealMonth"],
+            deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"],
+        )
+    ]
 
     deals_dedup["Current Month Renew DT Fallback"] = pd.to_datetime(
         deals_dedup["Current Month Renew Date"], errors="coerce"
@@ -1160,6 +1221,7 @@ def make_excel(
         "EmailKey",
         "Latest Annual PayDT (AsOf MonthEnd)",
         "Annual Payment Type (AsOf MonthEnd)",
+        "Annual Qualification Reason (AsOf MonthEnd)",
         "Latest Annual Amount Description (AsOf MonthEnd)",
         "Latest Annual Amount (AsOf MonthEnd)",
         "Annual User Current Month Upsell Amount",
