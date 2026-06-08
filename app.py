@@ -31,7 +31,7 @@ ALLOWED_ANNUAL_BREAKDOWN_NUMS = [
 
 ANNUAL_AMOUNT_THRESHOLD = 40.0
 ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
-ANNUAL_SUBSCRIPTION_TEXT_MARKERS = ["workspace subscription", "advance,", "starter,", "stater,"]
+ANNUAL_SUBSCRIPTION_TEXT_MARKERS = ["workspace subscription", "advance", "starter", "stater"]
 ANNUAL_OR_YEARLY_RE = re.compile(r"\b(?:annual|yearly)\b", re.IGNORECASE)
 
 # Annual users can buy add-ons after moving to annual. For annual-user upsell, exclude
